@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,25 +27,118 @@ def _rows(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
 
 
-def replay(engine: Engine, ns: str, k: int = 1, limit: int | None = None) -> dict:
+def _dataset(engine: Engine, ns: str, after=None, limit: int | None = None) -> list[dict]:
     rows = _rows(engine.ns_dir(ns) / "dataset.jsonl")
-    rows = rows[:limit] if limit else rows
+    if after is not None:                 # jeu tenu à l'écart : décisions postérieures à la date (ex. création des leçons)
+        a = parse_instant(after)
+        if a is None:
+            raise ValueError("--after doit être une date ISO 8601")
+        rows = [r for r in rows if (parse_instant(r["request"].get("now")) or a) >= a]
+    return rows[:limit] if limit else rows
+
+
+def replay(engine: Engine, ns: str, k: int = 1, limit: int | None = None, lessons="on", after=None) -> dict:
+    """Rejoue le jeu de régression en dry_run (rien n'est journalisé). lessons : "on", "off", ou liste de textes
+    (leçons substituées, par exemple volontairement erronées). Chaque exécution est inscrite au registre des essais.
+    Limite : le jeu est stocké après masquage (redact_paths) ; un cas qui dépend d'un champ masqué est signalé."""
+    rows = _dataset(engine, ns, after, limit)
+    override = None if lessons == "on" else lessons
     results = []
     for i, row in enumerate(rows):
         ok_all, got = True, []
         for j in range(k):
             req = {**row["request"], "idempotency_key": None, "run_id": f"eval-{time.time_ns()}-{i}-{j}"}
             try:
-                dec = engine.decide(req)
+                dec = engine.decide(req, dry_run=True, lessons_override=override)
+                if dec.get("model_errors") and dec.get("proposed") is None:   # panne de fournisseur, pas une décision
+                    raise LLMError(dec["rationale"][:200])
                 got.append(dec["action"]["name"])
                 ok_all &= dec["action"]["name"] == row["expected_action"]
             except (LLMError, ValueError) as e:
                 got.append(f"error:{e}"); ok_all = False
-        results.append({"expected": row["expected_action"], "got": got, "pass_k": ok_all})
+        results.append({"expected": row["expected_action"], "got": got, "pass_k": ok_all,
+                        "redacted": "[redacted]" in json.dumps(row["request"])})
     n = len(results)
     pass1 = sum(r["got"][0] == r["expected"] for r in results if r["got"]) / n if n else None
     passk = sum(r["pass_k"] for r in results) / n if n else None
-    return {"namespace": ns, "cases": n, "k": k, "pass_1": pass1, "pass_k": passk, "results": results}
+    mode = lessons if isinstance(lessons, str) else f"substituted:{len(lessons)}"
+    engine._append(ns, "trials.jsonl", {"ts": time.time(), "kind": "replay", "lessons": mode, "after": after, "k": k,
+                                        "cases": n, "pass_1": pass1, "pass_k": passk})
+    return {"namespace": ns, "cases": n, "k": k, "lessons": mode, "after": after, "pass_1": pass1, "pass_k": passk,
+            "errors": sum(any(str(g).startswith("error:") for g in r["got"]) for r in results),
+            "redacted_cases": sum(r["redacted"] for r in results), "results": results}
+
+
+def compare_lessons(engine: Engine, ns: str, wrong_lessons: list[str] | None = None, after=None, limit: int | None = None) -> dict:
+    """Ablation appariée de la mémoire : mêmes cas, leçons on / off / erronées. Test du signe sur les paires discordantes."""
+    arms = {"on": replay(engine, ns, lessons="on", after=after, limit=limit),
+            "off": replay(engine, ns, lessons="off", after=after, limit=limit)}
+    if wrong_lessons:
+        arms["wrong"] = replay(engine, ns, lessons=wrong_lessons, after=after, limit=limit)
+    ok = {a: [r["got"][0] == r["expected"] for r in res["results"]] for a, res in arms.items()}
+    err = {a: [str(r["got"][0]).startswith("error:") for r in res["results"]] for a, res in arms.items()}
+    def paired(a, b):
+        keep = [i for i in range(len(ok[a])) if not err[a][i] and not err[b][i]]   # une panne n'est pas une victoire
+        wins = sum(ok[a][i] and not ok[b][i] for i in keep); losses = sum(ok[b][i] and not ok[a][i] for i in keep)
+        return {"better": wins, "worse": losses, "pairs": len(keep), "excluded_errors": len(ok[a]) - len(keep),
+                "p_value": calib.sign_test(wins, losses)}
+    out = {"namespace": ns, "cases": arms["on"]["cases"], "pass_1": {a: r["pass_1"] for a, r in arms.items()},
+           "on_vs_off": paired("on", "off")}
+    if "wrong" in arms:
+        out["on_vs_wrong"] = paired("on", "wrong")
+    out["note"] = ("les leçons aident si on_vs_off.better > worse avec p < 0,05 ; sous ~30 paires discordantes, ne pas conclure. "
+                   "Évaluer sur des décisions postérieures à la création des leçons (--after).")
+    return out
+
+
+def fit_decision_calibration(engine: Engine, ns: str, target_accuracy: float = 0.9, min_n: int = 30, split: float = 0.7) -> dict:
+    """Calibre la confiance du décideur sur les issues réelles (decision_scores.jsonl, dernière étiquette par décision).
+    Découpage chronologique : Platt et seuils appris sur les 70 % anciens, précision et couverture RAPPORTÉES sur les 30 %
+    récents (pas de fuite). Seuil = plus petite confiance dont la borne de Wilson atteint la précision visée. Écriture
+    atomique, fusionnée avec la calibration existante (un point qui repasse sous min_n garde son ancien seuil)."""
+    epoch0 = datetime.fromtimestamp(0, tz=timezone.utc)
+    rows = _rows(engine.ns_dir(ns) / "decision_scores.jsonl")
+    last: dict[str, dict] = {}
+    for r in rows:                           # l'ordre du fichier = l'ordre des révisions : la dernière ligne gagne
+        last[r["decision_id"]] = r
+    rows = sorted(last.values(), key=lambda r: parse_instant(r.get("created_now")) or epoch0)
+    current = engine.decision_calibration(ns)
+    out_cal: dict = {"platt": dict(current.get("platt") or {}), "thresholds": {k: dict(v) for k, v in (current.get("thresholds") or {}).items()},
+                     "target_accuracy": target_accuracy, "fitted_at": time.time()}
+    report: dict = {"namespace": ns, "decisions": len(rows), "tiers": {}, "thresholds": {}}
+    for tier in sorted({r["tier"] for r in rows}):
+        rs = [r for r in rows if r["tier"] == tier]
+        k = int(len(rs) * split)
+        xs, ys = [r["confidence_eff"] for r in rs], [r["correct"] for r in rs]
+        fit = calib.fit_if_better(xs, ys, min_n=min_n, split=split)
+        if fit and fit["method"] == "platt":
+            out_cal["platt"][tier] = {"a": fit["a"], "b": fit["b"], "fitted_on": fit["fitted_on"]}
+        elif fit:
+            out_cal["platt"].pop(tier, None)
+        cal = [calib.platt_apply(x, fit["a"], fit["b"]) for x in xs] if fit and fit["method"] == "platt" else xs
+        report["tiers"][tier] = {"n": len(rs), "accuracy": calib.mean([float(y) for y in ys]),
+                                 "auroc": calib.auroc(xs, ys), "aurc_test": calib.aurc(cal[k:], ys[k:]),
+                                 "mean_confidence": calib.mean(xs), "platt": fit}
+        for dp in sorted({r["decision_point"] for r in rs}):
+            tr = [i for i in range(k) if rs[i]["decision_point"] == dp]
+            te = [i for i in range(k, len(rs)) if rs[i]["decision_point"] == dp]
+            if len(tr) < min_n:
+                report["thresholds"].setdefault(dp, {})[tier] = f"moins de {min_n} issues d'apprentissage (seuil existant conservé)"
+                continue
+            t = calib.selective_threshold([cal[i] for i in tr], [ys[i] for i in tr], target_accuracy)
+            t = 1.01 if t is None else round(t, 4)       # aucune confiance n'atteint la cible : escalader (les propositions
+            out_cal["thresholds"].setdefault(dp, {})[tier] = t   # escaladées restent scorées, le seuil peut redescendre)
+            kept = [i for i in te if cal[i] >= t]
+            report["thresholds"].setdefault(dp, {})[tier] = {
+                "threshold": t, "train_n": len(tr), "test_n": len(te),
+                "test_coverage": len(kept) / len(te) if te else None,
+                "test_accuracy": calib.mean([float(ys[i]) for i in kept]) if kept else None}
+    path = engine.ns_dir(ns) / "decision_calibration.json"
+    tmp = path.with_suffix(".tmp"); tmp.write_text(json.dumps(out_cal, indent=1)); os.replace(tmp, path)
+    report["note"] = ("auroc proche de 0,5 : la confiance ne distingue pas les erreurs ; test_accuracy est mesurée sur des "
+                      "décisions non vues ; un seuil appris ne descend jamais sous le seuil configuré, et expire après "
+                      "calibration_max_age_days")
+    return report
 
 
 def outcome_summary(engine: Engine, ns: str, horizon_hours: float | None = None, now: datetime | None = None) -> dict:

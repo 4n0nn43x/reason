@@ -27,6 +27,8 @@ Agents wired into automations get worse over time, and the causes are measured, 
 | It worked yesterday, nothing changed, it fails today | Providers change models and infrastructure silently; standard evals missed a weeks-long regression in 2025 |
 | Given freedom to "improve itself", it cheats | 30 to 74 % of self-modifying runs in published studies game the test or the proxy metric instead of the task |
 
+Sources: [NoLiMa, ICML 2025](https://proceedings.mlr.press/v267/modarressi25a.html) · [Sinha et al., ICLR 2026](https://arxiv.org/abs/2509.09677) · [Anthropic, long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) · [Anthropic postmortem, Sept. 2025](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) · [METR, reward hacking](https://metr.org/blog/2025-06-05-recent-reward-hacking/) · [Reward Hacking in Self-Improving Code Agents, ICLR 2026 workshop](https://iclr.cc/virtual/2026/10018648)
+
 Reason applies the countermeasures that hold up: decide little and decide typed, reason only on escalation, learn through a human-validated queue, measure continuously, and enforce guardrails outside the model.
 
 ## How it works
@@ -328,9 +330,34 @@ python -m reason fingerprint                 # deterministic signature per model
 
 Schedule both daily (cron, n8n Schedule, GitHub Actions). Track `pass^k`, not the average: it is the number that predicts production.
 
-## Maintenance agent (optional)
+## No self-modifying agent
 
-`.github/workflows/reason-maintain.yml` runs weekly, reads recurring lessons and evals, and proposes **one** patch to `reason/` as a pull request. It never pushes by itself, tests and scripts are re-read from `main` before running, and the diff goes through `scripts/check_diff.py` (touched test files, added `skip`/`xfail`, removed assertions). Merging stays human. A root file named `AGENT_PAUSED` suspends it. Never enable it in a repository whose code influences real money or positions: there, every change goes through a human pull request and paper trading first.
+Earlier versions shipped a weekly maintenance workflow that proposed patches to Reason itself. It was removed in 0.3: it had no data to read on a CI runner, and the tests it ran still imported the code it had just modified, so a patch could have rigged them. That is exactly the failure mode Reason exists to prevent. `scripts/check_diff.py` remains as a standalone CI check that flags touched test files, added `skip`/`xfail` markers and removed assertions in any pull request.
+## Proving it works
+
+Three independent reviews converged on the same point: a valid JSON decision is not a correct one, and a model's self-reported confidence is not calibrated. 0.3 adds the tooling to measure, not just assert.
+
+**Calibrated decision confidence.** Every outcome on a model-made decision is recorded as (confidence, correct) in `decision_scores.jsonl`. Then:
+
+```bash
+python -m reason calibrate acme/invoices --decisions --target-accuracy 0.9
+```
+
+fits Platt scaling per tier (kept only if it improves a held-out time split), reports AUROC (does confidence separate right from wrong at all?) and AURC (area under the risk-coverage curve), and learns an escalation threshold per decision point on the older 70 % of outcomes: the lowest calibrated confidence whose Wilson lower bound reaches the target accuracy. Coverage and accuracy at that threshold are then reported on the recent 30 %, which the fit never saw. A learned threshold never goes below the configured one (unless `allow_threshold_below_default`) and expires after `calibration_max_age_days`. Proposals that were escalated are still scored when a human answers, so a threshold can come back down. Decisions then carry `confidence` (calibrated), `confidence_raw`, `threshold` and `calibrated`.
+
+**Sample agreement.** With `"decide": {"n_samples": 3}` (or `constraints.n_samples` per request), the decider is sampled several times; the majority action wins, its share of votes becomes `agreement` (divided by the samples requested, so a provider failure counts against it), and the effective confidence never exceeds the agreement. Deterministic deciders such as Jev are called once.
+
+**Intent key for the executor.** Every executable decision carries `intent_key`, a stable hash of namespace, decision, action and parameters. Pass it as `client_order_id`, `Idempotency-Key` or `ClOrdID`: every resend of the order that comes from this decision carries the same key and the downstream system can deduplicate it. To get the same decision (hence the same key) back after a crash, send `idempotency_key` with the request. Reason's idempotency stops at the decision; your executor must reconcile with the broker or provider before resending.
+
+**Lesson ablation on a held-out set.**
+
+```bash
+python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after 2026-10-01T00:00:00Z
+```
+
+replays the regression set three times on the same cases (lessons on, off, deliberately wrong), only on decisions made after the given date, and reports paired wins and losses with an exact sign test. Replays are dry runs: nothing is journaled. Every replay is appended to `trials.jsonl`, so the number of variants tried is known when judging a result.
+
+Orders of magnitude to keep in mind: telling a 55 % hit rate from 50 % takes roughly 600 to 800 independent outcomes; 52 % from 50 %, about 4 000 to 6 600.
 
 ## Security model
 
@@ -339,12 +366,13 @@ Schedule both daily (cron, n8n Schedule, GitHub Actions). Track `pass^k`, not th
 - Lessons are never written by a model directly: proposals land in a pending queue and are approved by a human. Each lesson is capped at 300 characters.
 - `state`, `event`, tool inputs are untrusted data. The prompts say so, but prompt injection remains possible: keep irreversible actions behind a P0 rule or `ask_human`.
 - Append-only journal per namespace (`DecisionMade`, `OutcomeRecorded`, `Executed`), reloaded at startup. Tool inputs from Claude Code hooks are truncated to 4 000 characters before logging.
+- 0.3: the server refuses to start without authentication (`serve --insecure` is allowed on a loopback address only). Besides the admin `REASON_TOKEN`, `config.tokens` maps secrets to namespaces (glob patterns) and scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), checked on HTTP, MCP and hooks. One `reason serve` per `data_dir` (file lock). Playbook writes and journal appends are file-locked across processes.
+- 0.3: `redact_paths` (for example `state.facts.iban`, limited to `event`, `state`, `history`, `context`, `ruling_text`, `input`) masks sensitive fields in everything persisted (journal, datasets, scores) while the model still sees the full request; free text such as a model rationale is not masked; `reason prune <ns> --days N` removes old journal events except decisions still awaiting an outcome.
 
 ## Project layout
 
 ```
 reason/
-  core.py        engine: validation, rules, tiers, journal, outcome, execute
   llm.py         OpenAI-compatible client (urllib), strict or json_object output, retries
   jev.py         Jev (TypeSafe) adapter, same chat() interface
   lessons.py     per-namespace playbook: counters, dedup, pruning, pending queue
@@ -359,7 +387,7 @@ reason/
   __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    config (v0.1 and v0.2), request, rules v2 and their test cases, n8n workflow, Claude Code settings
-tests/test_reason.py         45 offline tests
+tests/test_reason.py         60 offline tests
 ```
 
 ```bash

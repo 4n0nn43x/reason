@@ -151,3 +151,71 @@ def aggregate_binary(ps: list[float]) -> tuple[float, tuple[float, float] | None
         raise ValueError("aucun échantillon")
     p = sigmoid(sum(logit(x) for x in ps) / len(ps))
     return p, ((min(ps), max(ps)) if len(ps) >= 3 else None)
+
+
+def auroc(scores: list[float], labels: list[int]) -> float | None:
+    """Probabilité qu'une décision juste ait une confiance plus haute qu'une décision fausse (rangs moyens, ex aequo gérés)."""
+    pos = sum(labels); neg = len(labels) - pos
+    if not pos or not neg:
+        return None
+    order = sorted(range(len(scores)), key=lambda i: scores[i])
+    ranks = [0.0] * len(scores)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and scores[order[j + 1]] == scores[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    rank_pos = sum(r for r, l in zip(ranks, labels) if l)
+    return (rank_pos - pos * (pos + 1) / 2) / (pos * neg)
+
+
+def risk_coverage(scores: list[float], labels: list[int]) -> list[tuple[float, float, float]]:
+    """Courbe risque-couverture de la classification sélective : pour chaque seuil t (confiance décroissante),
+    (t, couverture = part des décisions gardées, risque = taux d'erreur parmi elles)."""
+    pairs = sorted(zip(scores, labels), key=lambda x: -x[0])
+    out, wrong = [], 0
+    for k, (sc, lab) in enumerate(pairs, 1):
+        wrong += 1 - lab
+        if k == len(pairs) or pairs[k][0] != sc:
+            out.append((sc, k / len(pairs), wrong / k))
+    return out
+
+
+def aurc(scores: list[float], labels: list[int]) -> float | None:
+    """Aire sous la courbe risque-couverture (plus bas = la confiance trie mieux les erreurs)."""
+    rc = risk_coverage(scores, labels)
+    if not rc:
+        return None
+    area, prev_cov = 0.0, 0.0
+    for _, cov, risk in rc:
+        area += (cov - prev_cov) * risk
+        prev_cov = cov
+    return area
+
+
+def selective_threshold(scores: list[float], labels: list[int], target_accuracy: float, min_kept: int = 10) -> float | None:
+    """Plus petit seuil t tel que la BORNE INFÉRIEURE de Wilson de la précision des décisions de confiance ≥ t atteigne
+    target_accuracy (et au moins min_kept décisions gardées). Prudent : 9 justes sur 10 ne suffisent pas pour 0,9.
+    None si aucun seuil n'y arrive."""
+    best = None
+    pairs = sorted(zip(scores, labels), key=lambda x: -x[0])
+    kept = right = 0
+    for i, (sc, lab) in enumerate(pairs):
+        kept += 1; right += lab
+        last_of_tie = i + 1 == len(pairs) or pairs[i + 1][0] != sc
+        if last_of_tie and kept >= min_kept and wilson_lower(right, kept) >= target_accuracy:
+            best = sc
+    return best
+
+
+def sign_test(wins: int, losses: int) -> float:
+    """p-valeur bilatérale exacte du test du signe sur paires discordantes (McNemar exact)."""
+    n = wins + losses
+    if n == 0:
+        return 1.0
+    k = min(wins, losses)
+    p = sum(math.comb(n, i) for i in range(0, k + 1)) / 2 ** n
+    return min(1.0, 2 * p)

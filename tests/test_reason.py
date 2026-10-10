@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,8 @@ from reason.llm import LLMError  # noqa: E402
 
 class FakeLLM:
     """Renvoie les réponses scriptées dans l'ordre ; enregistre les prompts reçus."""
+    temperature = 0.0          # se comporte comme un LLM échantillonnable (Jev, lui, n'a pas d'attribut temperature)
+
     def __init__(self, name, answers):
         self.name, self.answers, self.calls, self.model = name, list(answers), [], f"fake-{name}"
     def chat(self, messages, schema=None, temperature=0.0, max_tokens=None, retries=1):
@@ -26,6 +29,8 @@ class FakeLLM:
         if not self.answers:
             raise LLMError(f"{self.name}: plus de réponses scriptées")
         a = self.answers.pop(0)
+        if callable(a):
+            a = a(messages)
         if isinstance(a, Exception):
             raise a
         return a, {"total_tokens": 10}
@@ -810,6 +815,246 @@ class TestPollerUnmapped(unittest.TestCase):
         r2 = poller.tick(eng, src, tmp / "st.json")
         self.assertEqual(([x["decision_id"] for x in r2["posted"]], r2["unmapped"]), ([d_loss["decision_id"]], {}))
         self.assertEqual(eng._outcomes[d_loss["decision_id"]]["result"], "failure")
+
+
+class TestV03Proof(unittest.TestCase):
+    """Calibration de /decide, accord entre échantillons, clé d'intention, dry run, ablation, rétention, verrous, jetons."""
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_calibration_metrics(self):
+        from reason import calib
+        self.assertEqual(calib.auroc([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0]), 1.0)
+        self.assertEqual(calib.auroc([0.5, 0.5, 0.5, 0.5], [1, 0, 1, 0]), 0.5)
+        self.assertIsNone(calib.auroc([0.3, 0.4], [1, 1]))
+        self.assertEqual(calib.selective_threshold([0.9] * 40 + [0.5] * 10, [1] * 40 + [0] * 10, 0.9), 0.9)
+        self.assertIsNone(calib.selective_threshold([0.9] * 9 + [0.55], [1] * 10, 0.9))   # 10/10 : Wilson 0,72 < 0,9
+        self.assertIsNone(calib.selective_threshold([0.5] * 20, [0] * 20, 0.9))
+        self.assertLess(calib.aurc([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0]), calib.aurc([0.1, 0.2, 0.8, 0.9], [1, 1, 0, 0]))
+        self.assertAlmostEqual(calib.sign_test(10, 0), 2 / 1024)
+        self.assertEqual(calib.sign_test(0, 0), 1.0)
+
+    def test_sample_agreement_propensity_and_intent_key(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve", 0.95), typed("approve", 0.9), typed("escalate", 0.99)]),
+                     thresholds={"decider_confidence": 0.5})
+        eng.config["decide"] = {"n_samples": 3}
+        d = eng.decide(req())
+        self.assertEqual((d["action"]["name"], round(d["agreement"], 2), d["n_samples"], d["n_ok"]), ("approve", 0.67, 3, 3))
+        self.assertAlmostEqual(d["confidence_raw"], 0.925); self.assertAlmostEqual(d["confidence"], 2 / 3)   # plafonnée par l'accord
+        from reason.core import intent_key
+        self.assertEqual(d["intent_key"], intent_key("acme/invoices", d["decision_id"], "approve", {"limit": 900}))
+        self.assertTrue(d["intent_key"].startswith("ik_"))
+        h = engine(str(self.tmp / "h"), decider=FakeLLM("d", [typed("abstain")])).decide(req())
+        self.assertIsNone(h["intent_key"])                                       # ask_human : rien à exécuter
+
+    def test_dry_run_leaves_no_trace(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve")]))
+        d = eng.decide(req(idempotency_key="k"), dry_run=True)
+        self.assertEqual(d["action"]["name"], "approve")
+        self.assertEqual((eng._by_id, eng.pending("acme/invoices")), ({}, []))
+        self.assertFalse((self.tmp / "acme/invoices/journal.jsonl").exists())
+
+    def test_decision_calibration_learns_threshold_and_is_applied(self):
+        from reason.evalrun import fit_decision_calibration
+        import random
+        rng = random.Random(3)
+        confs = [rng.choice([0.55, 0.65, 0.8, 0.95]) for _ in range(240)]
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve", c) for c in confs]), thresholds={"decider_confidence": 0.5})
+        eng.models["rf"] = FakeLLM("rf", [{"lessons": []}] * 400); eng.roles["reflector"] = "rf"   # le reflector ne consomme pas les réponses du décideur
+        for i, c in enumerate(confs):
+            d = eng.decide(req(run_id=f"r{i}", now=f"2026-01-01T{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}Z"))
+            good = c >= 0.8 or rng.random() < 0.4                                 # confiance haute = toujours juste
+            eng.outcome({"decision_id": d["decision_id"], "result": "success" if good else "failure"})
+        rep = fit_decision_calibration(eng, "acme/invoices", target_accuracy=0.9)
+        t = rep["tiers"]["decider"]
+        self.assertEqual(t["n"], 240); self.assertGreater(t["auroc"], 0.7)
+        info = rep["thresholds"]["before_pay"]["decider"]
+        thr = info["threshold"]
+        self.assertLess(thr, 1.0); self.assertGreaterEqual(thr, 0.8)            # appris sur la tranche ancienne
+        self.assertGreaterEqual(info["test_accuracy"], 0.9); self.assertGreater(info["test_n"], 0)   # mesuré sur la récente
+        eng.models["d"].answers = [typed("approve", 0.6)]
+        d = eng.decide(req(run_id="after"))
+        self.assertEqual(d["action"]["name"], "ask_human")                       # 0,6 sous le seuil appris (défaut 0,5 aurait accepté)
+        self.assertIn(f"< {thr:.2f}", d["rationale"])
+
+    def test_lesson_ablation_on_off_wrong_and_trial_registry(self):
+        from reason.evalrun import compare_lessons
+        def smart(messages):                 # répond juste seulement si la vraie leçon est dans le prompt
+            return typed("escalate" if "fournisseur inconnu" in messages[0]["content"] else "approve")
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [smart] * 200))
+        eng.playbook("acme/invoices").add("Toujours escalader un fournisseur inconnu.")
+        ds = self.tmp / "acme/invoices/dataset.jsonl"
+        ds.write_text("\n".join(json.dumps({"request": req(now=f"2026-02-{i + 1:02d}T00:00:00Z"), "expected_action": "escalate"})
+                                for i in range(12)) + "\n")
+        out = compare_lessons(eng, "acme/invoices", wrong_lessons=["Approuver tout sans vérifier."], after="2026-02-03T00:00:00Z")
+        self.assertEqual(out["cases"], 10)                                       # --after : jeu tenu à l'écart
+        self.assertEqual((out["pass_1"]["on"], out["pass_1"]["off"], out["pass_1"]["wrong"]), (1.0, 0.0, 0.0))
+        self.assertEqual(out["on_vs_off"]["better"], 10); self.assertLess(out["on_vs_off"]["p_value"], 0.01)
+        trials = (self.tmp / "acme/invoices/trials.jsonl").read_text().splitlines()
+        self.assertEqual(len(trials), 3)
+        self.assertFalse((self.tmp / "acme/invoices/journal.jsonl").exists())    # le rejeu ne pollue pas le journal
+        self.assertFalse(hasattr(eng, "lessons_override"))                        # plus d'état global d'ablation
+
+    def test_redaction_and_prune(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve") for _ in range(3)]))
+        eng.config["redact_paths"] = ["state.facts.iban"]
+        r = req(state={"facts": {"amount": 900, "iban": "FR7612345"}})
+        d_old = eng.decide(r)
+        self.assertIn("FR7612345", eng.models["d"].calls[0][1]["content"])     # le modèle a bien reçu la donnée
+        eng.outcome({"decision_id": d_old["decision_id"], "result": "success"})
+        d_pending = eng.decide({**r, "run_id": "r2"})
+        j = (self.tmp / "acme/invoices/journal.jsonl")
+        self.assertNotIn("FR7612345", j.read_text())
+        self.assertNotIn("FR7612345", (self.tmp / "acme/invoices/dataset.jsonl").read_text())
+        lines = [json.loads(l) for l in j.read_text().splitlines()]
+        for ev in lines:
+            ev["ts"] = 0                                                         # tout est vieux
+        j.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+        out = eng.prune("acme/invoices", days=30)
+        kept = [json.loads(l) for l in j.read_text().splitlines()]
+        self.assertEqual([e["decision"]["decision_id"] for e in kept], [d_pending["decision_id"]])   # seule la décision en attente reste
+        self.assertEqual(out["removed"], 2)
+
+    def test_two_playbook_instances_do_not_lose_updates(self):
+        a = Playbook(self.tmp / "p.json"); l = a.add("Leçon partagée.")
+        b = Playbook(self.tmp / "p.json")                                        # « autre processus », chargé avant les écritures
+        for _ in range(5):
+            a.feedback([l["id"]], helpful=True); b.feedback([l["id"]], helpful=True)
+        self.assertEqual(Playbook(self.tmp / "p.json").get(l["id"])["helpful"], 11)
+
+    def test_scoped_tokens_and_refusal_without_auth(self):
+        tmp = str(self.tmp)
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve") for _ in range(5)]))
+        other = eng.decide(req(namespace="other/ns"))
+        server.Handler.engine = eng
+        server.Handler.token = "admin"
+        server.Handler.tokens = {"t-acme": {"namespaces": ["acme/*"], "scopes": ["decide", "outcome", "read"]}}
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        def call(method, path, body, tok):
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            c.request(method, path, json.dumps(body) if body is not None else None, {"Authorization": f"Bearer {tok}"})
+            r = c.getresponse(); r.read(); return r.status
+        try:
+            self.assertEqual(call("POST", "/decide", req(), "t-acme"), 200)
+            self.assertEqual(call("POST", "/decide", req(namespace="other/ns"), "t-acme"), 403)
+            self.assertEqual(call("POST", "/outcome", {"decision_id": other["decision_id"], "result": "success"}, "t-acme"), 403)
+            self.assertEqual(call("POST", "/execute", {"namespace": "acme/x", "task": "t"}, "t-acme"), 403)   # scope absent
+            self.assertEqual(call("GET", "/lessons/acme/invoices", None, "t-acme"), 200)
+            self.assertEqual(call("GET", "/lessons/other/ns", None, "t-acme"), 403)
+            self.assertEqual(call("POST", "/decide", req(namespace="other/ns", run_id="z"), "admin"), 200)
+            self.assertEqual(call("POST", "/decide", req(), "nope"), 401)
+        finally:
+            srv.shutdown(); server.Handler.tokens = {}; server.Handler.token = None
+        with self.assertRaises(SystemExit):
+            server.serve({"data_dir": tmp, "models": {}, "roles": {}})
+
+
+class TestV03ReviewFixes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_second_engine_after_prune_sees_new_decisions(self):
+        a = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve") for _ in range(60)]))
+        b = engine(str(self.tmp), decider=FakeLLM("d", []))
+        for i in range(20):
+            a.decide(req(run_id=f"x{i}"))
+        b.refresh()
+        j = self.tmp / "acme/invoices/journal.jsonl"
+        lines = [json.loads(l) for l in j.read_text().splitlines()]
+        for ev in lines:
+            ev["ts"] = 0
+        j.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+        for d in list(a._by_id):
+            a.outcome({"decision_id": d, "result": "success"})                 # toutes réglées, donc purgeables
+        a.prune("acme/invoices", days=1)
+        for i in range(30):
+            a.decide(req(run_id=f"y{i}"))
+        self.assertEqual(len(b.pending("acme/invoices")), 30)                    # l'inode a changé : relu depuis le début
+
+    def test_prune_keeps_pending_estimates_and_horizon_expired_decisions(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve"), est(0.6)]))
+        d = eng.decide(req(correlation_key="m:1"))
+        eng.outcome({"decision_id": d["decision_id"], "result": "unknown", "source": "poller",
+                     "source_ref": f"horizon:{d['decision_id']}", "label_confidence": 0.0})
+        e = eng.estimate({"namespace": "acme/invoices", "question": "?", "kind": "binary"})
+        j = self.tmp / "acme/invoices/journal.jsonl"
+        lines = [json.loads(l) for l in j.read_text().splitlines()]
+        for ev in lines:
+            ev["ts"] = 0
+        j.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+        eng.prune("acme/invoices", days=1)
+        eng2 = engine(str(self.tmp), decider=FakeLLM("d", []))
+        self.assertEqual([p["decision_id"] for p in eng2.pending("acme/invoices")], [d["decision_id"]])
+        self.assertTrue(eng2.estimate_outcome({"estimate_id": e["estimate_id"], "outcome": 1})["recorded"])
+        with self.assertRaises(ValueError):
+            eng2.prune("acme/invoices", days=0)
+
+    def test_revision_and_escalated_proposal_write_labels(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve", 0.9), typed("approve", 0.3)]),
+                     thresholds={"decider_confidence": 0.5})
+        eng.models["rf"] = FakeLLM("rf", [{"lessons": []}] * 10); eng.roles["reflector"] = "rf"
+        d = eng.decide(req())
+        eng.outcome({"decision_id": d["decision_id"], "result": "success", "source_ref": "a"})
+        eng.outcome({"decision_id": d["decision_id"], "result": "failure", "source_ref": "b", "version": 2})
+        esc = eng.decide(req(run_id="r2"))
+        self.assertEqual((esc["tier"], esc["proposed"]["action"]), ("escalation", "approve"))
+        eng.outcome({"decision_id": esc["decision_id"], "result": "success", "human_feedback": {"correct_action": "approve"}})
+        rows = [json.loads(l) for l in (self.tmp / "acme/invoices/decision_scores.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["decision_id"] == d["decision_id"], r["correct"]) for r in rows[:2]], [(True, 1), (True, 0)])
+        self.assertEqual((rows[2]["escalated"], rows[2]["correct"], rows[2]["confidence_eff"]), (True, 1, 0.3))
+
+    def test_learned_threshold_never_below_default_and_expires(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve", 0.6) for _ in range(3)]), thresholds={"decider_confidence": 0.75})
+        cal = self.tmp / "acme/invoices"; cal.mkdir(parents=True)
+        (cal / "decision_calibration.json").write_text(json.dumps({"fitted_at": time.time(), "thresholds": {"before_pay": {"decider": 0.5}}}))
+        self.assertEqual(eng.decide(req())["action"]["name"], "ask_human")      # 0,6 < max(0,5 appris, 0,75 configuré)
+        eng.thresholds["allow_threshold_below_default"] = True
+        self.assertEqual(eng.decide(req(run_id="r2"))["action"]["name"], "approve")
+        (cal / "decision_calibration.json").write_text(json.dumps({"fitted_at": 0, "thresholds": {"before_pay": {"decider": 0.5}}}))
+        eng.thresholds["allow_threshold_below_default"] = True
+        self.assertEqual(eng.decide(req(run_id="r3"))["action"]["name"], "ask_human")   # périmée : seuil configuré
+
+    def test_concurrent_playbook_threads_do_not_lose_updates(self):
+        a = Playbook(self.tmp / "p.json"); l = a.add("Leçon.")
+        b = Playbook(self.tmp / "p.json")
+        def work(pb):
+            for _ in range(50):
+                pb.feedback([l["id"]], helpful=True)
+        ts = [threading.Thread(target=work, args=(pb,)) for pb in (a, b, a, b)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(Playbook(self.tmp / "p.json").get(l["id"])["helpful"], 201)
+
+    def test_ablation_excludes_error_pairs_and_after_is_validated(self):
+        from reason.evalrun import compare_lessons
+        calls = {"n": 0}
+        def flaky(messages):
+            calls["n"] += 1
+            if "utile" not in messages[0]["content"] and calls["n"] % 2 == 0:
+                return LLMError("panne")
+            return typed("escalate")
+        eng = engine(str(self.tmp), decider=FakeLLM("d", [flaky] * 100))
+        eng.playbook("acme/invoices").add("Leçon utile.")
+        (self.tmp / "acme/invoices/dataset.jsonl").write_text("\n".join(json.dumps({"request": req(), "expected_action": "escalate"}) for _ in range(6)) + "\n")
+        out = compare_lessons(eng, "acme/invoices")
+        self.assertEqual(out["on_vs_off"]["worse"], 0); self.assertEqual(out["on_vs_off"]["better"], 0)   # pannes exclues, pas des victoires
+        self.assertGreater(out["on_vs_off"]["excluded_errors"], 0)
+        with self.assertRaises(ValueError):
+            compare_lessons(eng, "acme/invoices", after="pas une date")
+
+    def test_insecure_only_on_loopback_and_non_ascii_auth(self):
+        with self.assertRaises(SystemExit):
+            server.serve({"data_dir": str(self.tmp), "models": {}, "insecure": True}, host="0.0.0.0")
+        server.Handler.engine = engine(str(self.tmp), decider=FakeLLM("d", []))
+        server.Handler.token = "s3cret"
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            c.putrequest("GET", "/lessons/acme/invoices"); c.putheader("Authorization", "Bearer é".encode("latin-1")); c.endheaders()
+            self.assertEqual(c.getresponse().status, 401)
+        finally:
+            srv.shutdown(); server.Handler.token = None
 
 
 class TestCheckDiff(unittest.TestCase):

@@ -27,6 +27,8 @@ Les agents branchés dans des automatisations se dégradent avec le temps, et le
 | Ça marchait hier, rien n'a changé, ça échoue aujourd'hui | Les fournisseurs changent modèles et infrastructure en silence ; les evals standard ont raté une régression de plusieurs semaines en 2025 |
 | Laissé libre de « s'améliorer », il triche | 30 à 74 % des runs auto-modifiants des études publiées contournent le test ou la métrique au lieu de résoudre la tâche |
 
+Sources : [NoLiMa, ICML 2025](https://proceedings.mlr.press/v267/modarressi25a.html) · [Sinha et al., ICLR 2026](https://arxiv.org/abs/2509.09677) · [Anthropic, agents longue durée](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) · [post-mortem Anthropic, sept. 2025](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) · [METR, reward hacking](https://metr.org/blog/2025-06-05-recent-reward-hacking/) · [Reward Hacking in Self-Improving Code Agents, atelier ICLR 2026](https://iclr.cc/virtual/2026/10018648)
+
 Reason applique les contre-mesures qui tiennent : décider peu et décider typé, raisonner seulement sur escalade, apprendre à travers une file validée par un humain, mesurer en continu, et appliquer les garde-fous hors du modèle.
 
 ## Comment ça marche
@@ -328,9 +330,34 @@ python -m reason fingerprint                 # signature déterministe par modè
 
 À planifier chaque jour (cron, n8n Schedule, GitHub Actions). Suivez `pass^k`, pas la moyenne : c'est le chiffre qui prédit la production.
 
-## Agent de maintenance (optionnel)
+## Pas d'agent qui se modifie
 
-`.github/workflows/reason-maintain.yml` tourne chaque semaine, lit les leçons récurrentes et les evals, et propose **un** patch sur `reason/` sous forme de pull request. Il ne pousse jamais lui-même, tests et scripts sont relus depuis `main` avant exécution, et le diff passe par `scripts/check_diff.py` (fichiers de tests touchés, `skip`/`xfail` ajoutés, assertions supprimées). La fusion reste humaine. Un fichier `AGENT_PAUSED` à la racine le suspend. Ne l'activez jamais dans un dépôt dont le code influence de l'argent ou des positions réelles : là, chaque changement passe par une pull request humaine et du paper trading d'abord.
+Les versions précédentes livraient un workflow hebdomadaire qui proposait des patchs à Reason lui-même. Il a été retiré en 0.3 : il n'avait aucune donnée à lire sur un runner de CI, et les tests qu'il exécutait importaient le code qu'il venait de modifier, si bien qu'un patch aurait pu les truquer. C'est exactement le mode d'échec que Reason doit empêcher. `scripts/check_diff.py` reste disponible comme contrôle de CI autonome : il signale, dans toute pull request, les fichiers de tests touchés, les marqueurs `skip`/`xfail` ajoutés et les assertions supprimées.
+## Prouver que ça marche
+
+Trois relectures indépendantes ont convergé sur le même point : une décision en JSON valide n'est pas une décision correcte, et la confiance qu'un modèle s'attribue n'est pas calibrée. La 0.3 ajoute de quoi mesurer, pas seulement affirmer.
+
+**Confiance des décisions calibrée.** Chaque issue d'une décision prise par un modèle est enregistrée sous la forme (confiance, juste ou non) dans `decision_scores.jsonl`. Ensuite :
+
+```bash
+python -m reason calibrate acme/invoices --decisions --target-accuracy 0.9
+```
+
+ajuste un Platt par palier (gardé seulement s'il améliore un découpage temporel tenu à l'écart), rapporte l'AUROC (la confiance sépare-t-elle seulement le juste du faux ?) et l'AURC (aire sous la courbe risque-couverture), et apprend un seuil d'escalade par point de décision sur les 70 % d'issues les plus anciennes : la plus petite confiance calibrée dont la borne inférieure de Wilson atteint la précision visée. Couverture et précision à ce seuil sont ensuite rapportées sur les 30 % récents, jamais vus par l'ajustement. Un seuil appris ne descend jamais sous le seuil configuré (sauf `allow_threshold_below_default`) et expire après `calibration_max_age_days`. Les propositions escaladées restent scorées quand un humain répond, si bien qu'un seuil peut redescendre. Les décisions portent alors `confidence` (calibrée), `confidence_raw`, `threshold` et `calibrated`.
+
+**Accord entre échantillons.** Avec `"decide": {"n_samples": 3}` (ou `constraints.n_samples` par requête), le décideur est interrogé plusieurs fois ; l'action majoritaire gagne, sa part des votes devient `agreement` (divisée par le nombre d'échantillons demandés : une panne de fournisseur compte contre), et la confiance effective ne dépasse jamais l'accord. Les décideurs déterministes comme Jev ne sont appelés qu'une fois.
+
+**Clé d'intention pour l'exécutant.** Chaque décision exécutable porte `intent_key`, une empreinte stable du namespace, de la décision, de l'action et des paramètres. Passez-la comme `client_order_id`, `Idempotency-Key` ou `ClOrdID` : tout renvoi de l'ordre issu de cette décision porte la même clé et le système en aval peut le dédoublonner. Pour retrouver la même décision (donc la même clé) après un crash, envoyez `idempotency_key` avec la requête. L'idempotence de Reason s'arrête à la décision ; votre exécutant doit réconcilier avec le broker ou le prestataire avant tout renvoi.
+
+**Ablation des leçons sur un jeu tenu à l'écart.**
+
+```bash
+python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after 2026-10-01T00:00:00Z
+```
+
+rejoue le jeu de régression trois fois sur les mêmes cas (leçons actives, désactivées, volontairement erronées), uniquement sur les décisions postérieures à la date donnée, et rapporte les gains et pertes appariés avec un test du signe exact. Les rejeux sont en dry run : rien n'est journalisé. Chaque rejeu est inscrit dans `trials.jsonl`, pour connaître le nombre de variantes essayées au moment de juger un résultat.
+
+Ordres de grandeur à garder en tête : distinguer un taux de réussite de 55 % de 50 % demande environ 600 à 800 issues indépendantes ; 52 % de 50 %, environ 4 000 à 6 600.
 
 ## Modèle de sécurité
 
@@ -339,12 +366,13 @@ python -m reason fingerprint                 # signature déterministe par modè
 - Les leçons ne sont jamais écrites directement par un modèle : les propositions arrivent dans une file d'attente et sont approuvées par un humain. Chaque leçon est limitée à 300 caractères.
 - `state`, `event` et les entrées d'outils sont des données non fiables. Les prompts le disent, mais l'injection reste possible : gardez les actions irréversibles derrière une règle P0 ou `ask_human`.
 - Journal append-only par namespace (`DecisionMade`, `OutcomeRecorded`, `Executed`), rechargé au démarrage. Les entrées d'outils des hooks Claude Code sont tronquées à 4 000 caractères avant journalisation.
+- 0.3 : le serveur refuse de démarrer sans authentification (`serve --insecure` n'est permis que sur une adresse locale). En plus du `REASON_TOKEN` administrateur, `config.tokens` associe des secrets à des namespaces (motifs glob) et à des scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), vérifiés en HTTP, en MCP et dans les hooks. Un seul `reason serve` par `data_dir` (verrou de fichier). Les écritures du playbook et du journal sont verrouillées entre processus.
+- 0.3 : `redact_paths` (par exemple `state.facts.iban`, limité à `event`, `state`, `history`, `context`, `ruling_text`, `input`) masque les champs sensibles dans tout ce qui est persisté (journal, jeux de données, scores), alors que le modèle voit la requête complète ; le texte libre, comme la justification d'un modèle, n'est pas masqué ; `reason prune <ns> --days N` retire les vieux événements du journal, sauf les décisions encore en attente d'issue.
 
 ## Arborescence
 
 ```
 reason/
-  core.py        moteur : validation, règles, paliers, journal, outcome, execute
   llm.py         client compatible OpenAI (urllib), sortie stricte ou json_object, relances
   jev.py         adaptateur Jev (TypeSafe), même interface chat()
   lessons.py     playbook par namespace : compteurs, dédup, élagage, file d'attente
@@ -359,7 +387,7 @@ reason/
   __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
-tests/test_reason.py         45 tests hors ligne
+tests/test_reason.py         60 tests hors ligne
 ```
 
 ```bash

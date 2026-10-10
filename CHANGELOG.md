@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 (2026-10-10)
+
+Driven by three independent reviews and a research pass on trading models: measure, do not assert.
+
+### Added
+- **Calibrated decision confidence.** Outcomes of model-made decisions are recorded as (confidence, correct) in `decision_scores.jsonl`. `reason calibrate <ns> --decisions` fits Platt per tier on a chronological 70/30 split, reports AUROC and test-set AURC, and learns an escalation threshold per decision point on the older 70 %: the lowest calibrated confidence whose Wilson lower bound reaches the target accuracy, with coverage and accuracy reported on the unseen recent 30 %. A learned threshold never goes below the configured one (unless `allow_threshold_below_default`) and expires after `calibration_max_age_days`. Escalated proposals are scored when a human answers, so thresholds can come back down. Every trusted revision writes a new label. Decisions carry `confidence` (calibrated), `confidence_raw`, `threshold`, `calibrated`.
+- **Sample agreement.** `decide.n_samples` (or `constraints.n_samples`) samples the decider several times; majority action, `agreement` (over the samples requested), `n_ok`, effective confidence capped by agreement. Deterministic deciders (Jev) are called once.
+- **`intent_key`** on every executable decision: a per-decision key to pass downstream as `client_order_id`, `Idempotency-Key` or `ClOrdID`; send `idempotency_key` to get the same decision, hence the same key, after a crash.
+- **Lesson ablation**: `reason eval <ns> --compare-lessons [wrong.json] --after <date>` replays the same held-out cases with lessons on, off and deliberately wrong, with paired wins/losses and an exact sign test; pairs where either arm hit a provider failure are excluded and counted. `--lessons on|off|file` for single runs. Replays are dry runs and every run is logged to `trials.jsonl`.
+- **`decide(..., dry_run=True)`**: nothing journaled, indexed or counted.
+- **Scoped tokens**: `config.tokens` maps secrets to namespace globs and scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), enforced on HTTP, MCP and hooks; the admin `REASON_TOKEN` keeps full access.
+- **Retention and redaction**: `redact_paths` (under `event`, `state`, `history`, `context`, `ruling_text`, `input`) masks sensitive fields in everything persisted; free text is not masked. `reason prune <ns> --days N` removes old journal events except pending decisions (including horizon-expired ones) and unresolved estimates; other processes detect the rewritten file by inode.
+
+### Changed
+- **Breaking**: the server refuses to start without authentication; `serve --insecure` is allowed on a loopback address only (and then checks the `Host` header). Only one `reason serve` per `data_dir` (file lock). Token comparison works on bytes (non-ASCII headers give 401, not a crash). Authorization failures raise a dedicated error, distinct from filesystem permission errors.
+- Playbook writes, journal appends and dataset/score appends are file-locked across processes (no lost counter updates or interleaved lines between `serve`, `poll` and the CLI). Calibration files are written atomically and merged.
+- Example reasoner budget raised to 16 000 tokens (reasoning tokens count against the limit).
+- README: sources for the "Why" table, a "Proving it works" section, duplicate layout entry removed.
+
+An independent review of this release found 34 issues (7 high); all were fixed and covered by tests before release.
+
+### Removed
+- **The weekly maintenance workflow.** It had no data to read on CI, and the tests it ran imported the code it had just modified, so a patch could have rigged them. `scripts/check_diff.py` stays as a standalone CI check.
+
 ## 0.2.1 (2026-10-10)
 
 ### Fixed

@@ -6,6 +6,7 @@ Stdlib uniquement (ThreadingHTTPServer).
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -35,7 +36,14 @@ MCP_TOOLS = [
     {"name": "estimate_outcome", "description": "Résout une estimation (issue réelle) pour la scorer (Brier, log-loss) et créditer les leçons.",
      "inputSchema": ESTIMATE_OUTCOME_SCHEMA},
 ]
-TOOLS = ("decide", "outcome", "execute", "estimate", "estimate_outcome")
+SCOPE = {"decide": "decide", "outcome": "outcome", "execute": "execute", "estimate": "estimate", "estimate_outcome": "estimate"}
+
+
+class Forbidden(Exception):
+    """Jeton valide mais sans droit sur ce scope ou ce namespace (distinct d'un PermissionError du système de fichiers)."""
+
+
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 def load_config(path: str | None = None) -> dict:
@@ -47,7 +55,9 @@ def load_config(path: str | None = None) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     engine: Engine
-    token: str | None
+    token: str | None = None          # jeton administrateur (REASON_TOKEN) : tous les namespaces, tous les scopes
+    tokens: dict = {}                 # config["tokens"] : {secret: {"namespaces": ["acme/*"], "scopes": ["decide", ...]}}
+    insecure: bool = False            # aucun jeton : seulement avec serve --insecure
     server_version = f"Reason/{__version__}"
     timeout = 30   # un client qui annonce un Content-Length et n'envoie rien ne tient pas un thread indéfiniment
 
@@ -73,10 +83,45 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("objet JSON attendu")
         return obj
 
+    def _principal(self) -> dict | None:
+        """Droits du porteur du jeton, ou None. Comparaison à temps constant sur chaque jeton connu."""
+        table = dict(self.tokens or {})
+        if self.token:
+            table[self.token] = {"namespaces": ["*"], "scopes": ["*"]}
+        if not table:
+            return {"namespaces": ["*"], "scopes": ["*"]} if self.insecure else None
+        got = (self.headers.get("Authorization") or "").encode("utf-8", "surrogateescape")
+        found = None
+        for secret, rights in table.items():       # octets : compare_digest refuse les str non ASCII
+            if hmac.compare_digest(got, f"Bearer {secret}".encode("utf-8")):
+                found = rights
+        return found
+
     def _authed(self) -> bool:
-        if not self.token:
-            return True
-        return hmac.compare_digest(self.headers.get("Authorization") or "", f"Bearer {self.token}")
+        return self._principal() is not None
+
+    def _check(self, scope: str, ns: str | None) -> None:
+        """Lève PermissionError si le jeton n'a pas le scope sur ce namespace (namespace inconnu : jeton global requis)."""
+        pr = self._principal() or {}
+        scopes, nss = pr.get("scopes", []), pr.get("namespaces", [])
+        if "*" not in scopes and scope not in scopes:
+            raise Forbidden(f"scope {scope} non accordé à ce jeton")
+        if "*" in nss:
+            return
+        if not ns or not any(fnmatch.fnmatchcase(ns, pat) for pat in nss):
+            raise Forbidden("namespace non accordé à ce jeton")
+
+    def _ns_of(self, kind: str, body: dict) -> str | None:
+        if kind in ("decide", "execute", "estimate"):
+            return body.get("namespace") if isinstance(body.get("namespace"), str) else None
+        if kind == "outcome":
+            self.engine.refresh()
+            rec = self.engine._by_id.get(body.get("decision_id"))
+            return rec["request"]["namespace"] if rec else None
+        if kind == "estimate_outcome":
+            rec = self.engine._estimates.get(body.get("estimate_id"))
+            return rec["estimate"]["namespace"] if rec else None
+        return None
 
     def _origin_ok(self) -> bool:
         """Anti DNS rebinding (MCP) : un Origin présent doit être local ou dans REASON_ALLOWED_ORIGINS."""
@@ -94,6 +139,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(405, {"error": "pas de flux SSE : utiliser POST"})
         if not self._authed():
             return self._json(401, {"error": "non autorisé"})
+        if self.insecure and not self.token and not self.tokens:     # sans jeton : anti DNS rebinding sur l'en-tête Host
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+            if host not in LOOPBACK:
+                return self._json(403, {"error": "hôte refusé"})
+        if self.path.startswith(("/lessons/", "/pending/")):
+            try:
+                self._check("read", self.path.split("/", 2)[2])
+            except Forbidden as e:
+                return self._json(403, {"error": str(e)})
         if self.path.startswith("/lessons/"):
             ns = self.path[len("/lessons/"):]
             try:
@@ -116,21 +170,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "origine refusée"})
         try:
             body = self._body()
-            if self.path == "/decide":
-                return self._json(200, self.engine.decide(body))
-            if self.path == "/outcome":
-                return self._json(200, self.engine.outcome(body))
-            if self.path == "/execute":
-                return self._json(200, self.engine.execute(body))
-            if self.path == "/estimate":
-                return self._json(200, self.engine.estimate(body))
-            if self.path in ("/estimate/outcome", "/estimate_outcome"):
-                return self._json(200, self.engine.estimate_outcome(body))
+            route = {"/decide": "decide", "/outcome": "outcome", "/execute": "execute", "/estimate": "estimate",
+                     "/estimate/outcome": "estimate_outcome", "/estimate_outcome": "estimate_outcome"}.get(self.path)
+            if route:
+                self._check(SCOPE[route], self._ns_of(route, body))
+                return self._json(200, getattr(self.engine, route)(body))
             if self.path == "/mcp":
                 return self._mcp(body)
             if self.path == "/hooks/claude":
                 return self._json(200, self._claude_hook(body))
             return self._json(404, {"error": "inconnu"})
+        except Forbidden as e:
+            return self._json(403, {"error": str(e)})
         except (ValueError, KeyError) as e:
             return self._json(400, {"error": str(e)})
         except LLMError as e:
@@ -161,14 +212,15 @@ class Handler(BaseHTTPRequestHandler):
                 result = {"tools": MCP_TOOLS}
             elif method == "tools/call":
                 name, args = params.get("name"), params.get("arguments") or {}
-                fn = getattr(self.engine, name) if name in TOOLS else None
+                fn = getattr(self.engine, name) if name in SCOPE else None
                 if fn is None or not isinstance(args, dict):
                     return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"outil inconnu ou arguments invalides: {name}"}})
                 try:
+                    self._check(SCOPE[name], self._ns_of(name, args))
                     out = fn(args)
                     result = {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}],
                               "structuredContent": out, "isError": False}
-                except (ValueError, KeyError, LLMError) as e:
+                except (ValueError, KeyError, LLMError, Forbidden) as e:
                     result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
             else:
                 return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"méthode inconnue {method}"}})
@@ -181,6 +233,7 @@ class Handler(BaseHTTPRequestHandler):
     def _claude_hook(self, h: dict) -> dict:
         ev = h.get("hook_event_name")
         ns = os.environ.get("REASON_HOOK_NAMESPACE") or "claude/" + hook_namespace(h.get("cwd"))
+        self._check("decide" if ev == "PreToolUse" else "read", ns)
         if ev == "PreToolUse":
             tool_input = json.dumps(h.get("tool_input"), ensure_ascii=False)[:MAX_TOOL_INPUT_CHARS]
             # le point de décision inclut l'empreinte de l'entrée : l'anti-boucle ne vise que la répétition du même appel
@@ -210,11 +263,27 @@ def hook_namespace(cwd: str | None) -> str:
 
 
 def serve(config: dict, host: str = "127.0.0.1", port: int = 8787) -> None:
-    Handler.engine = Engine(config)
     Handler.token = config.get("token")
+    Handler.tokens = config.get("tokens") or {}
+    Handler.insecure = bool(config.get("insecure"))
+    if not Handler.token and not Handler.tokens and not Handler.insecure:
+        sys.exit("refus de démarrer sans authentification : définir REASON_TOKEN ou config.tokens (ou serve --insecure en local)")
+    if Handler.insecure and not Handler.token and not Handler.tokens and host not in LOOPBACK:
+        sys.exit("--insecure n'est permis que sur une adresse locale (127.0.0.1, localhost, ::1)")
+    engine = Engine(config)
+    # un seul serveur par data_dir : l'idempotence des décisions vit en mémoire de ce processus
+    lock = open(engine.data_dir / ".serve.lock", "a")
+    try:
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:      # pragma: no cover
+        pass
+    except OSError:
+        sys.exit(f"un autre `reason serve` utilise déjà {engine.data_dir}")
+    Handler.engine = engine
     srv = ThreadingHTTPServer((host, port), Handler)
-    print(f"Reason {__version__} sur http://{host}:{port}  rôles={Handler.engine.roles}  "
-          f"auth={'oui' if Handler.token else 'non (REASON_TOKEN non défini)'}", file=sys.stderr)
+    mode = "jeton administrateur" if Handler.token else ("jetons par namespace" if Handler.tokens else "AUCUNE (--insecure)")
+    print(f"Reason {__version__} sur http://{host}:{port}  rôles={engine.roles}  auth={mode}", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

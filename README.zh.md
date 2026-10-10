@@ -27,6 +27,8 @@
 | 昨天还好好的，什么都没改，今天就失败 | 供应商会静默更换模型和基础设施；2025 年标准评测漏掉了一次持续数周的回归 |
 | 一旦获得"自我改进"的自由，它就作弊 | 已发表研究中 30 % 到 74 % 的自我修改运行是在钻测试或代理指标的空子，而不是解决任务 |
 
+来源：[NoLiMa, ICML 2025](https://proceedings.mlr.press/v267/modarressi25a.html) · [Sinha 等, ICLR 2026](https://arxiv.org/abs/2509.09677) · [Anthropic，长时运行智能体](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) · [Anthropic 事故复盘，2025 年 9 月](https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues) · [METR，reward hacking](https://metr.org/blog/2025-06-05-recent-reward-hacking/) · [Reward Hacking in Self-Improving Code Agents，ICLR 2026 研讨会](https://iclr.cc/virtual/2026/10018648)
+
 Reason 采用经得起检验的对策：少决策、决策类型化，只在升级时推理，通过人工审核队列学习，持续度量，并把护栏放在模型之外执行。
 
 ## 工作原理
@@ -328,9 +330,34 @@ python -m reason fingerprint                 # 每个模型的确定性指纹；
 
 两者都每天调度（cron、n8n Schedule、GitHub Actions）。关注 `pass^k` 而不是平均值：它才是预测生产表现的数字。
 
-## 维护智能体（可选）
+## 不提供自我修改的智能体
 
-`.github/workflows/reason-maintain.yml` 每周运行，读取反复出现的经验和评测结果，以 pull request 的形式对 `reason/` 提出**一个**补丁。它从不自行推送，运行前会从 `main` 重新读取测试和脚本，diff 要经过 `scripts/check_diff.py`（改动的测试文件、新增的 `skip`/`xfail`、删除的断言）。合并仍由人工完成。根目录放一个 `AGENT_PAUSED` 文件即可暂停。 切勿在其代码会影响真实资金或仓位的仓库中启用它：那里的每次改动都必须先经过人工 pull request 和模拟交易。
+早期版本附带一个每周运行、为 Reason 自身提出补丁的维护工作流。0.3 中已将其移除：它在 CI 运行器上没有任何数据可读，而且它运行的测试仍会导入刚被它修改的代码，补丁完全可以操纵测试结果。这正是 Reason 要防止的失败模式。`scripts/check_diff.py` 仍保留为独立的 CI 检查：在任何 pull request 中标记被改动的测试文件、新增的 `skip`/`xfail` 标记以及被删除的断言。
+## 证明它有效
+
+三份独立评审得出同一个结论：合法的 JSON 决策不等于正确的决策，模型自报的置信度也没有经过校准。0.3 增加了度量工具，而不仅仅是断言。
+
+**决策置信度校准。** 每个由模型做出的决策的结果，都会以（置信度，是否正确）记录到 `decision_scores.jsonl`。然后：
+
+```bash
+python -m reason calibrate acme/invoices --decisions --target-accuracy 0.9
+```
+
+为每个层级拟合 Platt（仅当它在留出的时间切分上有所改善时才保留），报告 AUROC（置信度能否区分对错）和 AURC（风险-覆盖曲线下面积），并在较早的 70 % 结果上为每个决策点学习升级阈值：其 Wilson 下界达到目标准确率的最低校准置信度。该阈值下的覆盖率与准确率随后在拟合从未见过的最近 30 % 上报告。学到的阈值永远不会低于配置的阈值（除非设置 `allow_threshold_below_default`），并在 `calibration_max_age_days` 后过期。被升级的提议在人工回复后仍会计分，因此阈值可以回落。此后决策会带有 `confidence`（校准后）、`confidence_raw`、`threshold` 和 `calibrated`。
+
+**样本一致性。** 设置 `"decide": {"n_samples": 3}`（或在单次请求中设置 `constraints.n_samples`）后，决策器会被多次采样；多数动作胜出，其票数占比成为 `agreement`（按请求的样本数计算，服务商故障会拉低它），有效置信度永远不超过一致性。Jev 这类确定性决策器只调用一次。
+
+**给执行端的意图键。** 每个可执行的决策都带有 `intent_key`，即命名空间、决策、动作与参数的稳定哈希。把它作为 `client_order_id`、`Idempotency-Key` 或 `ClOrdID` 传递：源自该决策的订单每次重发都携带同一个键，下游系统可以据此去重。若要在崩溃后取回同一个决策（从而同一个键），请在请求中带上 `idempotency_key`。Reason 自身的幂等性止于决策；你的执行端在重发之前必须先与券商或服务商对账。
+
+**在留出集上做经验消融。**
+
+```bash
+python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after 2026-10-01T00:00:00Z
+```
+
+在相同用例上把回归集重放三次（经验开启、关闭、故意错误），只使用给定日期之后的决策，并用精确符号检验报告配对的胜负。重放是 dry run：不写入日志。每次重放都会追加到 `trials.jsonl`，以便在判断结果时知道一共尝试了多少种变体。
+
+需要牢记的数量级：要区分 55 % 与 50 % 的命中率，大约需要 600 到 800 个独立结果；区分 52 % 与 50 %，大约需要 4 000 到 6 600 个。
 
 ## 安全模型
 
@@ -339,12 +366,13 @@ python -m reason fingerprint                 # 每个模型的确定性指纹；
 - 经验绝不由模型直接写入：提案进入待审队列，由人工批准。每条经验上限 300 字符。
 - `state`、`event`、工具输入都是不可信数据。提示词会声明这一点，但提示注入仍然可能：把不可逆动作放在 P0 规则或 `ask_human` 之后。
 - 每个命名空间有只追加的日志（`DecisionMade`、`OutcomeRecorded`、`Executed`），启动时重新加载。来自 Claude Code 钩子的工具输入在记录前截断到 4 000 字符。
+- 0.3：没有认证时服务器拒绝启动（`serve --insecure` 仅允许在本地回环地址上使用）。除管理员 `REASON_TOKEN` 外，`config.tokens` 把密钥映射到命名空间（glob 模式）和作用域（`decide`、`outcome`、`execute`、`estimate`、`read`），在 HTTP、MCP 与钩子中都会校验。每个 `data_dir` 只允许一个 `reason serve`（文件锁）。经验手册与日志的写入在进程之间加锁。
+- 0.3：`redact_paths`（例如 `state.facts.iban`，仅限 `event`、`state`、`history`、`context`、`ruling_text`、`input`）会在所有持久化内容（日志、数据集、评分）中屏蔽敏感字段，而模型仍能看到完整请求；模型理由等自由文本不会被屏蔽；`reason prune <ns> --days N` 删除旧日志事件，仍在等待结果的决策除外。
 
 ## 项目结构
 
 ```
 reason/
-  core.py        引擎：校验、规则、层级、日志、outcome、execute
   llm.py         兼容 OpenAI 的客户端（urllib），严格或 json_object 输出，重试
   jev.py         Jev（TypeSafe）适配器，相同的 chat() 接口
   lessons.py     按命名空间的经验手册：计数器、去重、修剪、待审队列
@@ -359,7 +387,7 @@ reason/
   __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
-tests/test_reason.py         45 个离线测试
+tests/test_reason.py         60 个离线测试
 ```
 
 ```bash

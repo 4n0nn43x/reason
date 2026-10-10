@@ -1,6 +1,6 @@
 [project]
 name = "reason"
-version = "0.2.1"
+version = "0.3.0"
 description = "Module de décision bornée et d'amélioration continue, branchable sur toute automatisation (HTTP, MCP, hooks Claude Code)."
 requires-python = ">=3.11"
 dependencies = []

@@ -13,6 +13,12 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:      # pragma: no cover  (Windows : verrou de processus seulement)
+    fcntl = None
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -99,6 +105,22 @@ class Playbook:
                 self._external = [e for e in lessons if e["id"] not in local_ids]
                 self.warnings, self._external_sig = warnings, sig
 
+    @contextmanager
+    def _locked(self):
+        """Lecture-modification-écriture atomique entre threads ET entre processus (serve, poll, CLI) : verrou fcntl sur
+        un fichier .lock, relecture forcée du playbook sous verrou, puis écriture par remplacement atomique."""
+        with self._lock:
+            with open(self.path.with_suffix(".lock"), "a") as fd:
+                if fcntl:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    self._mtime = -1          # force la relecture : un autre processus a pu écrire
+                    self._refresh()
+                    yield
+                finally:
+                    if fcntl:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1))
@@ -170,8 +192,7 @@ class Playbook:
     # --- écriture
     def add(self, text: str, source="manual", helpful: int = 1, **extra) -> dict:
         text = " ".join(text.split())[:MAX_LESSON_CHARS]
-        with self._lock:
-            self._refresh()
+        with self._locked():
             for l in self.data["lessons"]:
                 if _similar(l["text"], text):          # doublon : on renforce au lieu d'ajouter
                     l["helpful"] += 1; l["archived"] = False
@@ -190,8 +211,7 @@ class Playbook:
 
     def feedback(self, ids: list[str], helpful: bool, brier: float | None = None, weight: int = 1) -> None:
         """weight = 1 pour appliquer, -1 pour annuler (révision d'une issue)."""
-        with self._lock:
-            self._refresh()
+        with self._locked():
             for lid in ids:
                 c = self._counters(lid)
                 if c is None:
@@ -205,8 +225,7 @@ class Playbook:
             self._save()
 
     def touch(self, ids: list[str]) -> None:
-        with self._lock:
-            self._refresh()
+        with self._locked():
             for lid in ids:
                 c = self._counters(lid)
                 if c is not None:
@@ -216,8 +235,7 @@ class Playbook:
     def propose(self, texts: list[str], source: str, **extra) -> list[str]:
         """Propositions en attente de validation humaine. Retourne les ids créés."""
         ids = []
-        with self._lock:
-            self._refresh()
+        with self._locked():
             for t in texts:
                 t = " ".join(t.split())[:MAX_LESSON_CHARS]
                 if not t or any(_similar(p["text"], t) for p in self.data["pending"] + self._all()):
@@ -234,8 +252,7 @@ class Playbook:
             return next((dict(l) for l in self._all() + self.data["pending"] if l["id"] == lid), None)
 
     def approve(self, lid: str) -> dict | None:
-        with self._lock:
-            self._refresh()
+        with self._locked():
             for i, p in enumerate(self.data["pending"]):
                 if p["id"] == lid:
                     self.data["pending"].pop(i); p["helpful"] = 1; p["status"] = "approved"
@@ -243,8 +260,7 @@ class Playbook:
         return None
 
     def reject(self, lid: str) -> bool:
-        with self._lock:
-            self._refresh()
+        with self._locked():
             before = len(self.data["pending"])
             self.data["pending"] = [p for p in self.data["pending"] if p["id"] != lid]
             self._save(); return len(self.data["pending"]) < before
