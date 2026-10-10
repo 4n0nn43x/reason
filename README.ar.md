@@ -229,6 +229,133 @@ python -m reason lessons acme/invoices approve L-003
 
 يتجاوز `decide` النماذج (0 ميلي ثانية، 0 دولار) حين يكون الإجراء مرشّحاً صالحاً. ينقض `forbid` مخرجات النماذج: ينتقل الإجراء إلى الطبقة التالية ثم إلى الإنسان. المعاملات: `eq ne gt gte lt lte in nin contains exists regex`. السياسة النثرية التي تقرؤها النماذج تُوضع في `policy.md`.
 
+## الجديد في 0.2: من الاختيارات إلى تقديرات مُقيَّمة
+
+كان Reason 0.1 يجيب عن *أي إجراء*. الإصدار 0.2 يجيب أيضاً عن *ما احتماله*، ويقيّم هذه الإجابة حين يحسم الواقع. كل ما يلي اختياري ومتوافق مع الإصدارات السابقة.
+
+</div>
+
+```mermaid
+flowchart LR
+    Q([سؤال]) --> E[POST /estimate<br/>p، مجال، مصدر، أدلة]
+    E --> C{معايرة Platt لهذا<br/>النطاق والمصدر؟}
+    C -- نعم --> P[p معايرة]
+    C -- لا --> R[p خام]
+    P --> A([الأتمتة لديك تتصرّف])
+    R --> A
+    S[(مصدر التسوية<br/>JSONL · HTTP · subgraph)] -- reason poll --> O[POST /outcome v2<br/>أو /estimate/outcome]
+    O --> B[Brier · log-loss · RPS<br/>لكل نطاق ومصدر ودرس]
+    B -- reason calibrate --fit --> C
+    B --> L[(عدّادات الدروس)]
+```
+
+<div dir="rtl">
+
+### تقديرات مُنمَّطة
+
+</div>
+
+```bash
+curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/delphi", "question": "هل سيفوز X بالانتخابات التمهيدية؟", "kind": "binary",
+       "market_price": 0.62, "resolves_at": "2026-11-04T06:00:00Z", "n_samples": 3}'
+```
+
+<div dir="rtl">
+
+قيمة `kind` هي `binary` (p ومجال 90 %)، أو `categorical` أو `ordinal` (توزيع يجب أن يكون مجموعه 1)، أو `quantity` (q05، q50، q95). يحمل كل تقدير `source` (`fact` مقروء من مصدر أولي مؤرَّخ، `model` من حساب قابل للإعادة، وإلا `opinion`)، و`evidence[]`، و`base_rate` اختيارياً، والدروس المستخدمة، والقيمتين `raw` و`calibrated`. مع `n_samples > 1` تُحسب العينات كمتوسط في فضاء اللوغاريتم-الأرجحية ويصبح تشتّتها هو المجال.
+
+حين تُحسم المسألة، يقيّمها `POST /estimate/outcome`: Brier وlog-loss (خام ومعاير)، وBrier للمعدل الأساسي ولسعر السوق كمرجعين، وRPS للنتائج المرتبة، والخطأ المطلق وتغطية المجال للكميات. تُنسب للدروس المستخدمة نقاط بحسب النتيجة.
+
+</div>
+
+```bash
+python -m reason calibrate trader/delphi            # لكل مصدر: Brier، المهارة مقابل المعدل الأساسي والسوق، تفكيك Murphy
+python -m reason calibrate trader/delphi --fit      # يتعلّم Platt لكل مصدر على تقسيم زمني 70/30 ولا يُبقيه إلا إذا تحسّن Brier الاختبار
+python -m reason calibrate trader/delphi --counterfactual   # يعيد كل تقدير محسوم دون كل درس: المقياس السببي
+```
+
+<div dir="rtl">
+
+يفصل تفكيك Murphy (Brier = الموثوقية - الدقة التمييزية + عدم اليقين) بين **المعايرة** (الموثوقية) و**القدرة التمييزية**. لا يُحسّن Reason أبداً مقياس ECE لأنه ليس قاعدة تقييم سليمة. لا يقرّر التقدير حجم أي مركز أبداً: العتبات والامتناع وتحديد الحجم تبقى في شيفرة حتمية خارج Reason.
+
+### النتائج المؤجلة والمُستطلِع
+
+يقبل `POST /outcome` الآن تسويات تصل بعد أسابيع وقد تُعدَّل:
+
+</div>
+
+```json
+{"decision_id": "d_3f9a…", "result": "no_outcome", "result_detail": "no_outcome", "payout_fraction": 0.12,
+ "value": -3.4, "settled_at": "2026-10-03T14:02:11Z", "source": "delphi_subgraph", "source_ref": "0xabc…:17",
+ "label_confidence": 1.0, "version": 1, "resolution_text": "…نص طرف ثالث غير موثوق…"}
+```
+
+<div dir="rtl">
+
+يضيف `result` القيم `partial` و`void` و`no_outcome`، وتُردّ إلى `success` أو `failure` أو `unknown` لعدّادات الدروس (النتيجة المجهولة ليست مكافأة ولا عقوبة). يجعل `source_ref` الإرسال آمناً عند التكرار؛ و`version` الأعلى يعدّل النتيجة ويلغي أثر الإصدار السابق على الدروس. النتائج ذات `label_confidence` المنخفضة تُسجَّل لكنها لا تحرّك العدّادات. يحصل كل قرار مُسوّى على مراجعة لاحقة بصيغة markdown (الأطروحة، ما حدث مع اقتباس نص التسوية، الفجوة، الدروس المقترحة)، تُعاد كتابتها مع سجل الإصدارات عند التعديل.
+
+</div>
+
+```bash
+python -m reason poll            # تمريرة واحدة على كل المصادر المهيّأة
+python -m reason poll --loop     # كل 5 دقائق
+python -m reason outcomes trader/delphi --horizon-hours 48   # معدل النجاح على الدفعة الناضجة، تغطية الوسوم، تأخّر المُستطلِع
+```
+
+<div dir="rtl">
+
+يقرأ المُستطلِع ملف JSONL محلياً أو نقطة HTTP JSON أو subgraph بلغة GraphQL انطلاقاً من علامة مائية محفوظة، ويطابق الحقول عبر الإعدادات، ويربط كل تسوية بالقرارات المعلّقة عبر `correlation_key` الذي مرّرته وقت القرار ونافذة زمنية، ويعلن القرارات التي تجاوزت أفقها `unknown`. انظر `examples/reason.config.v02.json` لملف `events.jsonl` الخاص بمتداول ولواجهة تسويات Polymarket.
+
+### القواعد v2
+
+</div>
+
+```json
+{"id": "window-closes-before-event",
+ "if": [{"path": "state.facts.window_end", "op": "before", "path2": "state.facts.event_at"}],
+ "decide": {"name": "ask_human"},
+ "reason": "نافذة التسوية ({state.facts.window_end}) تُغلق قبل الحدث ({state.facts.event_at})"}
+```
+
+<div dir="rtl">
+
+تقارن الشروط مساراً بقيمة أو بمسار آخر (`path2`)، وتتداخل عبر `all` و`any` و`not`، وتتضمن معاملات للتواريخ (`before`، `after`، `hours_until_gte`، `hours_until_lte`، `within_hours`). يأتي الوقت من `now` في الطلب، ويُملأ عند الاستلام إن غاب ويُنسخ في القرار، فيصبح كل تقييم قابلاً للإعادة. يعمل `regex` على نص غير موثوق مثل `ruling_text`: الأنماط يكتبها كاتب القواعد فقط، بحد 200 حرف، وتُفحص ضد المكمّمات المتداخلة، وتُطبّق على نص مقتطع ومُطبَّع اختيارياً، ويمكن اقتباس البند المطابق عبر `{match}`. صار `decide` المفروض يُقارَن الآن بقواعد `forbid`.
+
+</div>
+
+```bash
+python -m reason rules trader/delphi lint
+python -m reason rules trader/delphi test --cases examples/rules.test.example.json   # النجاح، القواعد التي لم تُفعَّل أبداً، التناقضات
+```
+
+<div dir="rtl">
+
+### دروس ذات نطاق وصلاحية ومستودع markdown
+
+تحمل الدروس الآن `tags` و`decision_points` و`valid_from` و`valid_until` و`status` ومصدرها. يرشّح الحقن حسب الحالة ونافذة الصلاحية والنطاق، ويرتّب حسب الحد الأدنى لويلسون لعدّادات مفيد/ضار، ويتوقف عند 6 دروس. يسرد `python -m reason lessons <ns> review` المرشحين للترقية (إلى قواعد P0 عبر PR بشري) والدروس التي تحتاج مراجعة.
+
+مع `vault_dir` يقرأ Reason الدروس من مستودع Obsidian أو git:
+
+</div>
+
+```markdown
+---
+id: V-012
+kind: lesson
+namespace: trader/delphi
+tags: [sport]
+decision_points: [before_bet]
+valid_until: 2026-12-31
+author: human
+---
+احتمالات ما قبل المباراة تفقد صلاحيتها عند صافرة البداية.
+```
+
+<div dir="rtl">
+
+ملفات `doctrine/` معتمدة، وملفات `postmortems/` قيد الانتظار، ما لم يقل `status:` غير ذلك. تُعزل الدروس التي بلا مصدر، وتُتجاهل المعرّفات المكررة ويُبلَّغ عنها، وتخرج الدروس المنتهية تلقائياً. الموافقة في Obsidian (تعديل `status:` أو نقل الملف) تسري عند القرار التالي. يكتب Reason المقترحات الجديدة كملفات جديدة و**لا يعدّل أبداً أي ملف موجود في المستودع**؛ تبقى العدّادات في بيانات Reason نفسها.
+
 ## ثلاث واجهات، محرّك واحد
 
 </div>
@@ -277,7 +404,7 @@ python -m reason fingerprint                 # بصمة حتمية لكل نمو
 
 ## وكيل الصيانة (اختياري)
 
-يعمل `.github/workflows/reason-maintain.yml` أسبوعياً، يقرأ الدروس المتكررة والتقييمات، ويقترح رقعة **واحدة** على `reason/` في صورة pull request. لا يدفع التغييرات بنفسه أبداً، وتُقرأ الاختبارات والسكربتات من `main` قبل التشغيل، ويمرّ الفرق عبر `scripts/check_diff.py` (ملفات اختبار مُعدَّلة، إضافة `skip`/`xfail`، حذف تأكيدات). يبقى الدمج بشرياً. ملف باسم `AGENT_PAUSED` في الجذر يوقفه.
+يعمل `.github/workflows/reason-maintain.yml` أسبوعياً، يقرأ الدروس المتكررة والتقييمات، ويقترح رقعة **واحدة** على `reason/` في صورة pull request. لا يدفع التغييرات بنفسه أبداً، وتُقرأ الاختبارات والسكربتات من `main` قبل التشغيل، ويمرّ الفرق عبر `scripts/check_diff.py` (ملفات اختبار مُعدَّلة، إضافة `skip`/`xfail`، حذف تأكيدات). يبقى الدمج بشرياً. ملف باسم `AGENT_PAUSED` في الجذر يوقفه. لا تفعّله أبداً في مستودع تؤثر شيفرته في أموال أو مراكز حقيقية: هناك يمرّ كل تغيير أولاً عبر pull request بشري وتداول تجريبي.
 
 ## نموذج الأمان
 
@@ -300,10 +427,15 @@ reason/
   reflector.py   فشل → مقترحات دروس
   evalrun.py     إعادة تشغيل الانحدار (pass@1، pass^k)، بصمة النموذج
   server.py      HTTP، MCP JSON-RPC، خطاف Claude Code
-  __main__.py    سطر الأوامر: serve decide outcome execute lessons eval fingerprint init
+  core.py        المحرّك: التحقق، الطبقات، السجل، outcome v2، المراجعات اللاحقة، estimate، execute
+  rules.py       قواعد P0 v2: path2، all/any/not، معاملات التاريخ، regex محدود، الاستيفاء، اختبار القواعد
+  calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
+  poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
+  vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
-tests/test_reason.py         24 اختباراً دون شبكة
+tests/test_reason.py         44 اختباراً دون شبكة
 ```
 
 ```bash

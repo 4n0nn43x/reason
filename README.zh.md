@@ -195,6 +195,101 @@ python -m reason lessons acme/invoices approve L-003
 
 当动作是有效候选时，`decide` 直接绕过模型（0 毫秒，0 美元）。`forbid` 否决模型的输出：该动作落到下一层，再到人类。运算符：`eq ne gt gte lt lte in nin contains exists regex`。供模型阅读的自然语言策略放在 `policy.md`。
 
+## 0.2 新增：从选择到可评分的估计
+
+Reason 0.1 回答*选哪个动作*。0.2 还回答*可能性有多大*，并在现实结果揭晓时给这个回答打分。以下全部可选，且向后兼容。
+
+```mermaid
+flowchart LR
+    Q([问题]) --> E[POST /estimate<br/>p、区间、来源、证据]
+    E --> C{该命名空间与来源<br/>有 Platt 校准吗？}
+    C -- 有 --> P[校准后的 p]
+    C -- 无 --> R[原始 p]
+    P --> A([你的自动化执行])
+    R --> A
+    S[(结算来源<br/>JSONL · HTTP · subgraph)] -- reason poll --> O[POST /outcome v2<br/>或 /estimate/outcome]
+    O --> B[Brier · log-loss · RPS<br/>按命名空间、来源、经验]
+    B -- reason calibrate --fit --> C
+    B --> L[(经验计数器)]
+```
+
+### 类型化估计
+
+```bash
+curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/delphi", "question": "X 会赢得初选吗？", "kind": "binary",
+       "market_price": 0.62, "resolves_at": "2026-11-04T06:00:00Z", "n_samples": 3}'
+```
+
+`kind` 可为 `binary`（p 与 90 % 区间）、`categorical` 或 `ordinal`（总和必须为 1 的分布）、`quantity`（q05、q50、q95）。每个估计都带有 `source`（`fact` 取自带日期的一手来源，`model` 来自可复现的计算，否则为 `opinion`）、`evidence[]`、可选的 `base_rate`、所用经验，以及 `raw` 与 `calibrated` 两组值。当 `n_samples > 1` 时，样本在对数几率空间平均，其离散度成为区间。
+
+问题揭晓后，`POST /estimate/outcome` 为其打分：Brier 与 log-loss（原始与校准），以基准率和市场价格的 Brier 作为参照，有序结果用 RPS，数量用绝对误差和区间覆盖。估计所用的经验会依据分数获得记分。
+
+```bash
+python -m reason calibrate trader/delphi            # 按来源：Brier、相对基准率与市场的技能分、Murphy 分解
+python -m reason calibrate trader/delphi --fit      # 按 70/30 时间切分为每个来源学习 Platt，仅在测试 Brier 改善时保留
+python -m reason calibrate trader/delphi --counterfactual   # 去掉每条经验重放每个已解决估计：因果度量
+```
+
+Murphy 分解（Brier = 可靠性 - 分辨率 + 不确定性）把**校准**（可靠性）与**区分能力**（分辨率）分开。Reason 从不优化 ECE，它不是严格恰当评分规则。估计从不决定仓位大小：阈值、弃权与仓位规模属于 Reason 之外的确定性代码。
+
+### 延迟结果与轮询器
+
+`POST /outcome` 现在接受数周后才到达、并且可能改判的结算：
+
+```json
+{"decision_id": "d_3f9a…", "result": "no_outcome", "result_detail": "no_outcome", "payout_fraction": 0.12,
+ "value": -3.4, "settled_at": "2026-10-03T14:02:11Z", "source": "delphi_subgraph", "source_ref": "0xabc…:17",
+ "label_confidence": 1.0, "version": 1, "resolution_text": "…不可信的第三方文本…"}
+```
+
+`result` 新增 `partial`、`void`、`no_outcome`，在经验计数中映射为 `success`、`failure` 或 `unknown`（未知结果既不奖励也不惩罚）。`source_ref` 让提交幂等；更高的 `version` 会修订结果，并撤销上一版本对经验的影响。`label_confidence` 低的结果会被记录但不改变计数。每个已结算决策都会生成一份 markdown 复盘（论点、发生了什么并引用结算文本、偏差、建议的经验），修订时连同版本历史重写。
+
+```bash
+python -m reason poll            # 对所有已配置来源执行一轮
+python -m reason poll --loop     # 每 5 分钟一次
+python -m reason outcomes trader/delphi --horizon-hours 48   # 成熟样本上的成功率、标签覆盖率、轮询延迟
+```
+
+轮询器从持久化水位线开始读取本地 JSONL、HTTP JSON 接口或 GraphQL subgraph，按配置映射字段，依据决策时传入的 `correlation_key` 和时间窗口把每笔结算匹配到待定决策，并把超过时限的决策标记为 `unknown`。交易者的 `events.jsonl` 与 Polymarket 结算 API 的配置见 `examples/reason.config.v02.json`。
+
+### 规则 v2
+
+```json
+{"id": "window-closes-before-event",
+ "if": [{"path": "state.facts.window_end", "op": "before", "path2": "state.facts.event_at"}],
+ "decide": {"name": "ask_human"},
+ "reason": "结算窗口（{state.facts.window_end}）在事件（{state.facts.event_at}）之前关闭"}
+```
+
+条件可把路径与常量或另一路径（`path2`）比较，用 `all`、`any`、`not` 嵌套，并提供日期运算符（`before`、`after`、`hours_until_gte`、`hours_until_lte`、`within_hours`）。时间取自请求中的 `now`，缺省时在接收时填入并复制到决策中，因此每次评估都可重放。`regex` 作用于 `ruling_text` 等不可信文本：模式只能由规则作者编写，上限 200 字符，加载时检查嵌套量词，作用于截断且可选归一化的文本，匹配到的条款可用 `{match}` 引用。被强制的 `decide` 现在会与 `forbid` 对照。
+
+```bash
+python -m reason rules trader/delphi lint
+python -m reason rules trader/delphi test --cases examples/rules.test.example.json   # 通过与否、从未触发的规则、矛盾
+```
+
+### 带作用域、有效期与 markdown 知识库的经验
+
+经验现在带有 `tags`、`decision_points`、`valid_from`、`valid_until`、`status` 及其来源。注入时按状态、有效期与作用域过滤，按有益/有害计数的 Wilson 下界排序，最多 6 条。`python -m reason lessons <ns> review` 列出可晋升的候选（经人工 PR 成为 P0 规则）以及需要复查的经验。
+
+设置 `vault_dir` 后，Reason 会从 Obsidian 知识库或 git 仓库读取经验：
+
+```markdown
+---
+id: V-012
+kind: lesson
+namespace: trader/delphi
+tags: [sport]
+decision_points: [before_bet]
+valid_until: 2026-12-31
+author: human
+---
+赛前赔率在开球时失效。
+```
+
+`doctrine/` 中的文件视为已批准，`postmortems/` 中的视为待审，除非 `status:` 另有说明。没有来源的经验会被隔离，重复 id 会被忽略并报告，过期经验自动退出。在 Obsidian 中批准（修改 `status:` 或移动文件）会在下一次决策时生效。Reason 把新提案写成新文件，**从不修改知识库中已有的文件**；计数保存在 Reason 自己的数据中。
+
 ## 三个门面，一个引擎
 
 ```mermaid
@@ -235,7 +330,7 @@ python -m reason fingerprint                 # 每个模型的确定性指纹；
 
 ## 维护智能体（可选）
 
-`.github/workflows/reason-maintain.yml` 每周运行，读取反复出现的经验和评测结果，以 pull request 的形式对 `reason/` 提出**一个**补丁。它从不自行推送，运行前会从 `main` 重新读取测试和脚本，diff 要经过 `scripts/check_diff.py`（改动的测试文件、新增的 `skip`/`xfail`、删除的断言）。合并仍由人工完成。根目录放一个 `AGENT_PAUSED` 文件即可暂停。
+`.github/workflows/reason-maintain.yml` 每周运行，读取反复出现的经验和评测结果，以 pull request 的形式对 `reason/` 提出**一个**补丁。它从不自行推送，运行前会从 `main` 重新读取测试和脚本，diff 要经过 `scripts/check_diff.py`（改动的测试文件、新增的 `skip`/`xfail`、删除的断言）。合并仍由人工完成。根目录放一个 `AGENT_PAUSED` 文件即可暂停。 切勿在其代码会影响真实资金或仓位的仓库中启用它：那里的每次改动都必须先经过人工 pull request 和模拟交易。
 
 ## 安全模型
 
@@ -256,10 +351,15 @@ reason/
   reflector.py   失败 → 经验提案
   evalrun.py     回归回放（pass@1、pass^k）、模型指纹
   server.py      HTTP、MCP JSON-RPC、Claude Code 钩子
-  __main__.py    CLI：serve decide outcome execute lessons eval fingerprint init
+  core.py        引擎：校验、层级、日志、outcome v2、复盘、estimate、execute
+  rules.py       P0 规则 v2：path2、all/any/not、日期运算符、受限正则、插值、规则测试
+  calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
+  poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
+  vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
+  __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
-tests/test_reason.py         24 个离线测试
+tests/test_reason.py         44 个离线测试
 ```
 
 ```bash

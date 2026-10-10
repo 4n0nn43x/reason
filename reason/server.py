@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import __version__
-from .core import EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine
+from .core import ESTIMATE_OUTCOME_SCHEMA, ESTIMATE_SCHEMA, EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine
 from .llm import LLMError
 
 MAX_BODY = 1_000_000
@@ -30,7 +30,12 @@ MCP_TOOLS = [
      "inputSchema": OUTCOME_SCHEMA},
     {"name": "execute", "description": "Exécute une tâche de texte/extraction avec le modèle exécuteur et les leçons du namespace.",
      "inputSchema": EXECUTE_SCHEMA},
+    {"name": "estimate", "description": "Estimation probabiliste calibrée (binaire, catégorielle, ordinale, quantité) avec source et preuves.",
+     "inputSchema": ESTIMATE_SCHEMA},
+    {"name": "estimate_outcome", "description": "Résout une estimation (issue réelle) pour la scorer (Brier, log-loss) et créditer les leçons.",
+     "inputSchema": ESTIMATE_OUTCOME_SCHEMA},
 ]
+TOOLS = ("decide", "outcome", "execute", "estimate", "estimate_outcome")
 
 
 def load_config(path: str | None = None) -> dict:
@@ -95,7 +100,13 @@ class Handler(BaseHTTPRequestHandler):
                 pb = self.engine.playbook(ns)
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
-            return self._json(200, {"namespace": ns, "lessons": pb.active(), "pending": pb.pending()})
+            return self._json(200, {"namespace": ns, "lessons": pb.active(), "pending": pb.pending(), "warnings": pb.warnings})
+        if self.path.startswith("/pending/"):
+            ns = self.path[len("/pending/"):]
+            try:
+                return self._json(200, {"namespace": ns, "pending": self.engine.pending(ns)})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
         self._json(404, {"error": "inconnu"})
 
     def do_POST(self):
@@ -111,6 +122,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.engine.outcome(body))
             if self.path == "/execute":
                 return self._json(200, self.engine.execute(body))
+            if self.path == "/estimate":
+                return self._json(200, self.engine.estimate(body))
+            if self.path in ("/estimate/outcome", "/estimate_outcome"):
+                return self._json(200, self.engine.estimate_outcome(body))
             if self.path == "/mcp":
                 return self._mcp(body)
             if self.path == "/hooks/claude":
@@ -146,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = {"tools": MCP_TOOLS}
             elif method == "tools/call":
                 name, args = params.get("name"), params.get("arguments") or {}
-                fn = {"decide": self.engine.decide, "outcome": self.engine.outcome, "execute": self.engine.execute}.get(name)
+                fn = getattr(self.engine, name) if name in TOOLS else None
                 if fn is None or not isinstance(args, dict):
                     return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"outil inconnu ou arguments invalides: {name}"}})
                 try:

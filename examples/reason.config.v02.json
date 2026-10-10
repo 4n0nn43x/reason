@@ -1,0 +1,28 @@
+{
+  "data_dir": "data",
+  "vault_dir": "/home/me/Obsidian Vault/reason",
+  "models": {
+    "typed":    {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY", "model": "gpt-6-luna", "json_schema": true},
+    "reasoner": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY", "model": "gpt-6.1-sol",
+                 "reasoning_effort": "high", "max_tokens_key": "max_completion_tokens", "temperature": null, "max_tokens": 4096},
+    "deepseek": {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-flash",
+                 "json_schema": false, "reasoning_effort": "none", "max_tokens": 2048}
+  },
+  "roles": {"decider": "typed", "reasoner": "reasoner", "executor": "deepseek", "reflector": "typed", "estimator": "typed"},
+  "thresholds": {"decider_confidence": 0.75, "reasoner_confidence": 0.6, "loop_max_repeats": 3,
+                 "lessons_max_chars": 1500, "max_lessons": 6, "label_confidence_min": 0.5},
+  "estimate": {"n_samples": 3},
+  "poller": {
+    "sources": [
+      {"name": "events", "namespace": "trader/delphi", "type": "jsonl", "path": "/var/trader/events.jsonl",
+       "horizon_hours": 72, "match_ttl_hours": 720,
+       "fields": {"correlation_key": "market", "result": "type", "value": "pnl", "settled_at": "ts", "ref": "tx"},
+       "result_map": {"REDEEM": "success", "LIQUIDATE": "failure", "NO_OUTCOME": "no_outcome"}},
+      {"name": "polymarket", "namespace": "trader/polymarket", "type": "http_json",
+       "url": "https://data-api.polymarket.com/v2/resolutions?condition={cursor}", "items": "data", "cursor": "resolved_at",
+       "fields": {"correlation_key": "condition_id", "result_detail": "status", "payout_fraction": "payouts.1",
+                  "settled_at": "resolved_at", "ref": "transaction_hash", "label_confidence": 0.9},
+       "result_map": {"resolved": "success"}}
+    ]
+  }
+}

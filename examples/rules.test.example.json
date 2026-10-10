@@ -1,0 +1,16 @@
+[
+  {"name": "fenêtre close avant l'événement",
+   "request": {"now": "2026-10-10T10:00:00Z", "state": {"facts": {"window_end": "2026-10-11T00:00:00Z", "event_at": "2026-10-12T00:00:00Z"}}},
+   "expect": {"decide": "ask_human"}},
+  {"name": "clause barrière",
+   "request": {"now": "2026-10-10T10:00:00Z", "ruling_text": "This market resolves YES if ANY Binance 1-minute candle trades above 100k."},
+   "expect": {"decide": "ask_human"}},
+  {"name": "source statique à 24 h",
+   "request": {"now": "2026-10-10T10:00:00Z", "state": {"facts": {"resolves_at": "2026-10-11T08:00:00Z", "source_kind": "static"}},
+               "ruling_text": "Otherwise, this market will resolve to No."},
+   "expect": {"decide": null, "forbid": ["open_thesis"]}},
+  {"name": "rien à signaler",
+   "request": {"now": "2026-10-10T10:00:00Z", "state": {"facts": {"resolves_at": "2026-12-01T00:00:00Z", "source_kind": "live", "amount": 5, "limit": 10}},
+               "ruling_text": "Otherwise, this market will resolve to No."},
+   "expect": {"decide": null, "forbid": []}}
+]

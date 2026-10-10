@@ -195,6 +195,101 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 
 `decide` short-circuits the models (0 ms, $0) when the action is a valid candidate. `forbid` vetoes the models' output: the action falls through to the next tier, then to the human. Operators: `eq ne gt gte lt lte in nin contains exists regex`. Prose policy read by the models lives in `policy.md`.
 
+## New in 0.2: from choices to scored estimates
+
+Reason 0.1 answered *which action*. 0.2 also answers *how likely*, and grades that answer when reality settles. Everything below is optional and backward compatible.
+
+```mermaid
+flowchart LR
+    Q([Question]) --> E[POST /estimate<br/>p, interval, source, evidence]
+    E --> C{Platt fit for<br/>namespace and source?}
+    C -- yes --> P[calibrated p]
+    C -- no --> R[raw p]
+    P --> A([Your automation acts])
+    R --> A
+    S[(Settlement source<br/>JSONL · HTTP · subgraph)] -- reason poll --> O[POST /outcome v2<br/>or /estimate/outcome]
+    O --> B[Brier · log-loss · RPS<br/>per namespace, source, lesson]
+    B -- reason calibrate --fit --> C
+    B --> L[(Lesson counters)]
+```
+
+### Typed estimates
+
+```bash
+curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/delphi", "question": "Will X win the primary?", "kind": "binary",
+       "market_price": 0.62, "resolves_at": "2026-11-04T06:00:00Z", "n_samples": 3}'
+```
+
+`kind` is `binary` (p and a 90 % interval), `categorical` or `ordinal` (a distribution that must sum to 1), or `quantity` (q05, q50, q95). Every estimate carries `source` (`fact` read from a dated primary source, `model` from a reproducible calculation, `opinion` otherwise), `evidence[]`, an optional `base_rate`, the lessons it used, and both `raw` and `calibrated` values. With `n_samples > 1` the samples are averaged in log-odds space and their spread becomes the interval.
+
+When the question settles, `POST /estimate/outcome` scores it: Brier and log-loss (raw and calibrated), Brier of the base rate and of the market price as references, RPS for ordinal outcomes, absolute error and interval coverage for quantities. Lessons used by the estimate are credited from the score.
+
+```bash
+python -m reason calibrate trader/delphi            # per source: Brier, skill vs base rate and market, Murphy decomposition
+python -m reason calibrate trader/delphi --fit      # learns Platt per source on a 70/30 time split, keeps it only if the test Brier improves
+python -m reason calibrate trader/delphi --counterfactual   # re-runs each resolved estimate without each lesson: the causal measure
+```
+
+Murphy's decomposition (Brier = reliability - resolution + uncertainty) separates **calibration** (reliability) from **discrimination** (resolution). Reason never optimizes ECE, which is not a proper score. The estimate never decides a size: thresholds, abstention and position sizing belong to deterministic code outside Reason.
+
+### Deferred outcomes and the poller
+
+`POST /outcome` now accepts settlements that arrive weeks later and change their mind:
+
+```json
+{"decision_id": "d_3f9a…", "result": "no_outcome", "result_detail": "no_outcome", "payout_fraction": 0.12,
+ "value": -3.4, "settled_at": "2026-10-03T14:02:11Z", "source": "delphi_subgraph", "source_ref": "0xabc…:17",
+ "label_confidence": 1.0, "version": 1, "resolution_text": "…untrusted third-party text…"}
+```
+
+`result` adds `partial`, `void` and `no_outcome`; they map to `success`, `failure` or `unknown` for lesson counters (an unknown outcome is neither a reward nor a penalty). `source_ref` makes posting idempotent; a higher `version` revises an outcome and undoes the previous version's effect on lessons. Low `label_confidence` outcomes are recorded but do not move counters. Every settled decision gets a markdown post-mortem (thesis, what happened with the resolution text quoted, gap, proposed lessons), rewritten with a version history on revision.
+
+```bash
+python -m reason poll            # one pass over every configured source
+python -m reason poll --loop     # every 5 minutes
+python -m reason outcomes trader/delphi --horizon-hours 48   # success rate on the mature cohort, label coverage, poller lag
+```
+
+The poller reads a local JSONL, an HTTP JSON endpoint or a GraphQL subgraph from a persisted watermark, maps fields through config, matches each settlement to pending decisions by the `correlation_key` you passed at decision time and a time window, and marks decisions past their horizon as `unknown`. See `examples/reason.config.v02.json` for a trader's `events.jsonl` and Polymarket's resolutions API.
+
+### Rules v2
+
+```json
+{"id": "window-closes-before-event",
+ "if": [{"path": "state.facts.window_end", "op": "before", "path2": "state.facts.event_at"}],
+ "decide": {"name": "ask_human"},
+ "reason": "Resolution window closes ({state.facts.window_end}) before the event ({state.facts.event_at})"}
+```
+
+Conditions compare a path to a value or to another path (`path2`), nest with `all`, `any` and `not`, and include date operators (`before`, `after`, `hours_until_gte`, `hours_until_lte`, `within_hours`). Time comes from `now` in the request, filled at reception if absent and copied into the decision, so every evaluation is replayable. `regex` works on untrusted text such as `ruling_text`: patterns are written by the rule author only, capped at 200 characters, linted against nested quantifiers, applied to truncated and optionally normalized text, and the matched clause can be quoted with `{match}`. A forced `decide` is now checked against `forbid`.
+
+```bash
+python -m reason rules trader/delphi lint
+python -m reason rules trader/delphi test --cases examples/rules.test.example.json   # pass/fail, never-matched rules, contradictions
+```
+
+### Lessons with scope, expiry and a markdown vault
+
+Lessons now carry `tags`, `decision_points`, `valid_from`, `valid_until`, a `status` and their provenance. Injection filters by status, validity window and scope, sorts by the Wilson lower bound of helpful/harmful, and stops at 6 lessons. `python -m reason lessons <ns> review` lists promotion candidates (to become P0 rules through a human PR) and lessons to review.
+
+Set `vault_dir` and Reason reads lessons from an Obsidian vault or a git repository:
+
+```markdown
+---
+id: V-012
+kind: lesson
+namespace: trader/delphi
+tags: [sport]
+decision_points: [before_bet]
+valid_until: 2026-12-31
+author: human
+---
+Pre-match odds go stale at kick-off.
+```
+
+Files in `doctrine/` are approved, files in `postmortems/` are pending, unless `status:` says otherwise. Lessons without provenance are quarantined, duplicate ids are ignored and reported, expired lessons drop out on their own. Approving in Obsidian (edit `status:` or move the file) takes effect at the next decision. Reason writes new proposals as new files and **never modifies an existing vault file**; counters stay in Reason's own data.
+
 ## Three facades, one engine
 
 ```mermaid
@@ -235,7 +330,7 @@ Schedule both daily (cron, n8n Schedule, GitHub Actions). Track `pass^k`, not th
 
 ## Maintenance agent (optional)
 
-`.github/workflows/reason-maintain.yml` runs weekly, reads recurring lessons and evals, and proposes **one** patch to `reason/` as a pull request. It never pushes by itself, tests and scripts are re-read from `main` before running, and the diff goes through `scripts/check_diff.py` (touched test files, added `skip`/`xfail`, removed assertions). Merging stays human. A root file named `AGENT_PAUSED` suspends it.
+`.github/workflows/reason-maintain.yml` runs weekly, reads recurring lessons and evals, and proposes **one** patch to `reason/` as a pull request. It never pushes by itself, tests and scripts are re-read from `main` before running, and the diff goes through `scripts/check_diff.py` (touched test files, added `skip`/`xfail`, removed assertions). Merging stays human. A root file named `AGENT_PAUSED` suspends it. Never enable it in a repository whose code influences real money or positions: there, every change goes through a human pull request and paper trading first.
 
 ## Security model
 
@@ -256,10 +351,15 @@ reason/
   reflector.py   failure → lesson proposals
   evalrun.py     regression replay (pass@1, pass^k), model fingerprint
   server.py      HTTP, MCP JSON-RPC, Claude Code hook
-  __main__.py    CLI: serve decide outcome execute lessons eval fingerprint init
+  core.py        engine: validation, tiers, journal, outcome v2, post-mortems, estimate, execute
+  rules.py       P0 rules v2: path2, all/any/not, date operators, bounded regex, interpolation, rule tests
+  calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
+  poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
+  vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
+  __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        test-tampering detector for PR diffs
-examples/                    config, request, n8n workflow, Claude Code settings
-tests/test_reason.py         24 offline tests
+examples/                    config (v0.1 and v0.2), request, rules v2 and their test cases, n8n workflow, Claude Code settings
+tests/test_reason.py         44 offline tests
 ```
 
 ```bash
