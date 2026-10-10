@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "http", "url": "http://127.0.0.1:8787/hooks/claude", "timeout": 10,
+                                 "headers": {"Authorization": "Bearer $REASON_TOKEN"}, "allowedEnvVars": ["REASON_TOKEN"]}]}],
+    "PreToolUse": [{"matcher": "Bash|Edit|Write",
+                    "hooks": [{"type": "http", "url": "http://127.0.0.1:8787/hooks/claude", "timeout": 30, "onFailure": "block",
+                               "headers": {"Authorization": "Bearer $REASON_TOKEN"}, "allowedEnvVars": ["REASON_TOKEN"]}]}]
+  }
+}

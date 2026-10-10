@@ -1,0 +1,19 @@
+{
+  "namespace": "acme/invoices",
+  "run_id": "n8n:exec:8841",
+  "decision_point": "before_pay",
+  "event": {"type": "invoice.received", "invoice_id": "INV-2041"},
+  "state": {"summary": "Facture reçue d'un nouveau fournisseur", "facts": {"amount": 1240, "vendor_known": false, "currency": "EUR"}},
+  "history": [{"decision_point": "before_pay", "action": "escalate", "outcome": "no_reply"}],
+  "candidate_actions": [
+    {"name": "approve", "description": "Payer la facture",
+     "schema": {"type": "object", "required": ["limit"], "properties": {"limit": {"type": "number"}}, "additionalProperties": false},
+     "rollback": {"condition": "vendor_rejected_within_24h", "compensating_action": "void_payment"}},
+    {"name": "ask_vendor", "description": "Demander un justificatif au fournisseur",
+     "schema": {"type": "object", "properties": {"message": {"type": "string"}}, "additionalProperties": false}},
+    {"name": "escalate", "description": "Transmettre à la comptabilité",
+     "schema": {"type": "object", "additionalProperties": false}}
+  ],
+  "constraints": {"allow_reasoner": true},
+  "idempotency_key": "n8n:exec:8841:before_pay"
+}

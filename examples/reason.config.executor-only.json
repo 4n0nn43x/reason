@@ -1,0 +1,8 @@
+{
+  "data_dir": "data",
+  "models": {
+    "deepseek": {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY",
+                 "model": "deepseek-flash", "json_schema": false, "reasoning_effort": "none"}
+  },
+  "roles": {"executor": "deepseek"}
+}

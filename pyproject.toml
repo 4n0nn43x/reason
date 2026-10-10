@@ -1,0 +1,17 @@
+[project]
+name = "reason"
+version = "0.1.0"
+description = "Module de décision bornée et d'amélioration continue, branchable sur toute automatisation (HTTP, MCP, hooks Claude Code)."
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+
+[project.scripts]
+reason = "reason.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["reason*"]

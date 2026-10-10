@@ -1,0 +1,27 @@
+{
+  "name": "Reason decide → act → outcome",
+  "nodes": [
+    {"parameters": {}, "name": "Trigger", "type": "n8n-nodes-base.manualTrigger", "typeVersion": 1, "position": [0, 0]},
+    {"parameters": {"method": "POST", "url": "http://reason:8787/decide", "sendHeaders": true,
+                    "headerParameters": {"parameters": [{"name": "Authorization", "value": "=Bearer {{ $env.REASON_TOKEN }}"}]},
+                    "sendBody": true, "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify({ namespace: 'acme/invoices', run_id: $execution.id, decision_point: 'before_pay', event: $json, state: { facts: { amount: $json.amount, vendor_known: $json.vendor_known } }, candidate_actions: [ { name: 'approve', schema: { type: 'object', required: ['limit'], properties: { limit: { type: 'number' } }, additionalProperties: false } }, { name: 'escalate', schema: { type: 'object', additionalProperties: false } } ], idempotency_key: $execution.id + ':before_pay' }) }}",
+                    "options": {}},
+     "name": "Reason decide", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [220, 0]},
+    {"parameters": {"rules": {"values": [
+        {"conditions": {"conditions": [{"leftValue": "={{ $json.action.name }}", "rightValue": "approve", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": true, "outputKey": "approve"},
+        {"conditions": {"conditions": [{"leftValue": "={{ $json.action.name }}", "rightValue": "escalate", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": true, "outputKey": "escalate"},
+        {"conditions": {"conditions": [{"leftValue": "={{ $json.needs_human.required }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true"}}]}, "renameOutput": true, "outputKey": "human"}]}, "options": {}},
+     "name": "Route on decision", "type": "n8n-nodes-base.switch", "typeVersion": 3, "position": [440, 0]},
+    {"parameters": {"method": "POST", "url": "http://reason:8787/outcome", "sendHeaders": true,
+                    "headerParameters": {"parameters": [{"name": "Authorization", "value": "=Bearer {{ $env.REASON_TOKEN }}"}]},
+                    "sendBody": true, "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify({ decision_id: $('Reason decide').item.json.decision_id, result: 'success', metrics: { latency_ms: 0 } }) }}", "options": {}},
+     "name": "Reason outcome", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [880, 0]}
+  ],
+  "connections": {
+    "Trigger": {"main": [[{"node": "Reason decide", "type": "main", "index": 0}]]},
+    "Reason decide": {"main": [[{"node": "Route on decision", "type": "main", "index": 0}]]},
+    "Route on decision": {"main": [[{"node": "Reason outcome", "type": "main", "index": 0}], [{"node": "Reason outcome", "type": "main", "index": 0}], []]}
+  }
+}
