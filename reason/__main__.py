@@ -50,14 +50,15 @@ def main(argv=None) -> int:
         out = eng.execute(_read(a.task))
     elif a.cmd == "lessons":
         pb = eng.playbook(a.namespace)
-        out = {"list": lambda: pb.active(), "pending": lambda: pb.data["pending"],
+        if a.action in ("approve", "reject", "add") and not a.value:
+            ap.error(f"lessons {a.action} attend une valeur (id ou texte)")
+        out = {"list": lambda: pb.active(), "pending": lambda: pb.pending(),
                "approve": lambda: pb.approve(a.value), "reject": lambda: pb.reject(a.value),
                "add": lambda: pb.add(a.value, source="manual")}[a.action]()
     elif a.cmd == "eval":
         out = replay(eng, a.namespace, k=a.k, limit=a.limit)
     elif a.cmd == "fingerprint":
         out = fingerprint(eng)
-        out = {"report": out["report"]}
     elif a.cmd == "init":
         d = eng.ns_dir(a.namespace)
         for name, content in (("rules.json", json.dumps(EXAMPLE_RULES, ensure_ascii=False, indent=1)), ("policy.md", EXAMPLE_POLICY)):

@@ -6,7 +6,7 @@ workflows CI ou CODEOWNERS touchés. Usage : git diff origin/main...HEAD | pytho
 import re
 import sys
 
-PROTECTED = re.compile(r"^(tests?/|evals?/|\.github/|\.claude/|CODEOWNERS|scripts/check_diff\.py)|(_test|\.test|\.spec|test_)[^/]*\.\w+$")
+PROTECTED = re.compile(r"^(tests?/|evals?/|\.github/|\.claude/|CODEOWNERS$|scripts/check_diff\.py$)|(^|/)(test_[^/]*|[^/]*(_test|\.test|\.spec))\.\w+$")
 SKIP = re.compile(r"\+.*(pytest\.mark\.skip|\.skip\(|xfail|@unittest\.skip|\.only\(|it\.skip|describe\.skip|--no-verify|# *noqa: *S|SKIP_TESTS)", re.I)
 ASSERT_REMOVED = re.compile(r"^-\s*(assert\b|self\.assert|expect\()")
 

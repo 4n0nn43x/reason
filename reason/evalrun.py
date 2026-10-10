@@ -24,9 +24,9 @@ def replay(engine: Engine, ns: str, k: int = 1, limit: int | None = None) -> dic
     rows = rows[:limit] if limit else rows
     results = []
     for i, row in enumerate(rows):
-        req = {**row["request"], "idempotency_key": None, "run_id": f"eval-{int(time.time())}-{i}"}
         ok_all, got = True, []
-        for _ in range(k):
+        for j in range(k):
+            req = {**row["request"], "idempotency_key": None, "run_id": f"eval-{time.time_ns()}-{i}-{j}"}
             try:
                 dec = engine.decide(req)
                 got.append(dec["action"]["name"])
@@ -40,9 +40,9 @@ def replay(engine: Engine, ns: str, k: int = 1, limit: int | None = None) -> dic
     return {"namespace": ns, "cases": n, "k": k, "pass_1": pass1, "pass_k": passk, "results": results}
 
 
-def fingerprint(engine: Engine, store: Path | None = None) -> dict:
+def fingerprint(engine: Engine) -> dict:
     """Signature déterministe (température 0) de chaque modèle configuré ; compare au dernier relevé."""
-    store = store or engine.data_dir / "fingerprints.json"
+    store = engine.data_dir / "fingerprints.json"
     prev = json.loads(store.read_text()) if store.exists() else {}
     cur, report = {}, {}
     for name, llm in engine.models.items():
@@ -59,4 +59,4 @@ def fingerprint(engine: Engine, store: Path | None = None) -> dict:
         report[name] = ("new" if not old else "same" if old["hash"] == h else "CHANGED")
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text(json.dumps(cur, ensure_ascii=False, indent=1))
-    return {"report": report, "fingerprints": cur, "previous": prev}
+    return {"report": report}

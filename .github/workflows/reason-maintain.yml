@@ -1,11 +1,12 @@
-# Agent de maintenance hebdomadaire : lit les leçons récurrentes et les évals, propose UN patch sur src/ par PR.
-# Il ne pousse jamais lui-même ; tests, evals, .github et .claude sont en lecture seule ; auto-merge seulement au palier 0.
+# Agent de maintenance hebdomadaire : lit les leçons récurrentes et les évals, propose UN patch sur reason/ par PR.
+# Il ne pousse jamais lui-même ; tests, scripts, .github et .claude sont en lecture seule ; la fusion reste humaine
+# (une PR ouverte avec GITHUB_TOKEN ne déclenche pas la CI, donc pas d'auto-merge ici).
 name: reason-maintain
 on:
   schedule: [{cron: "0 3 * * 1"}]
   workflow_dispatch:
 concurrency: reason-maintain
-permissions: {contents: write, pull-requests: write, id-token: write}
+permissions: {contents: write, pull-requests: write}
 jobs:
   improve:
     runs-on: ubuntu-latest
@@ -24,25 +25,24 @@ jobs:
             data/**/dataset.jsonl et le dernier rapport d'eval s'il existe. Propose UNE seule amélioration de code dans reason/
             qui corrige une cause récurrente (parsing, retries, bornes, prompt de décision). Écris d'abord un diagnostic et une
             prédiction falsifiable dans PATCH_NOTE.md, puis le patch minimal. Interdit : modifier tests/, scripts/, .github/, .claude/,
-            evals, ou pousser. Si rien de solide, écris-le dans PATCH_NOTE.md et n'édite rien d'autre.
+            data/, ou pousser. Si rien de solide, écris-le dans PATCH_NOTE.md et n'édite rien d'autre.
           settings: |
-            {"permissions":{"deny":["Edit(tests/**)","Edit(scripts/**)","Edit(.github/**)","Edit(.claude/**)","Edit(data/**)",
-                                     "Bash(git push*)","Bash(rm *)","Bash(curl *)"],
-                            "allow":["Bash(python -m unittest *)","Bash(git diff*)","Bash(git log*)","Bash(git status*)"]}}
+            {"permissions":{
+              "deny":["Edit(tests/**)","Write(tests/**)","Edit(scripts/**)","Write(scripts/**)","Edit(.github/**)","Write(.github/**)",
+                      "Edit(.claude/**)","Write(.claude/**)","Edit(data/**)","Write(data/**)",
+                      "Bash(git push*)","Bash(git commit*)","Bash(rm *)","Bash(curl *)","Bash(sed -i*)"],
+              "allow":["Edit(reason/**)","Write(reason/**)","Write(PATCH_NOTE.md)","Edit(PATCH_NOTE.md)",
+                       "Bash(python -m unittest *)","Bash(git diff*)","Bash(git log*)","Bash(git status*)"]}}
           claude_args: "--max-turns 40 --max-budget-usd 5 --permission-mode dontAsk"
-      - name: Tests after patch (tests relus depuis main)
+      - name: Tests after patch (tests et scripts relus depuis main)
         run: git checkout origin/main -- tests scripts && python -m unittest discover -s tests
       - name: Diff audit
-        run: git diff origin/main...HEAD -- . ':!PATCH_NOTE.md' | python scripts/check_diff.py
+        run: git add -A && git diff --cached origin/main -- . ':!PATCH_NOTE.md' | python scripts/check_diff.py
       - name: Open PR
         env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
         run: |
           git config user.name reason-bot && git config user.email reason-bot@users.noreply.github.com
-          git diff --quiet && { echo "aucun changement"; exit 0; }
+          git status --porcelain | grep -q . || { echo "aucun changement"; exit 0; }
           B="agent/$(date +%Y%m%d)-maintain"; git checkout -b "$B"; git add -A; git commit -m "Reason maintenance proposal"
           git push -u origin "$B"
-          gh pr create --fill --body-file PATCH_NOTE.md --label agent
-          LINES=$(git diff --shortstat origin/main...HEAD -- reason | awk '{print $4+$6}')
-          # palier 0 : diff < 50 lignes, uniquement reason/ : auto-merge soumis aux rulesets (CI verte requise)
-          if [ "${LINES:-0}" -lt 50 ] && [ -z "$(git diff --name-only origin/main...HEAD | grep -v '^reason/' | grep -v PATCH_NOTE.md)" ]; then
-            gh pr merge --auto --squash; fi
+          gh pr create --fill --body-file PATCH_NOTE.md --label agent || gh pr create --fill --body-file PATCH_NOTE.md

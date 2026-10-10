@@ -45,8 +45,9 @@ def req(**over):
 
 
 def typed(action, conf=0.9, params=None, used=None):
-    return {"action": action, "params": params or ({"limit": 900} if action == "approve" else {}),
-            "confidence": conf, "rationale": "test", "lessons_used": used or []}
+    params = params if params is not None else ({"limit": 900} if action == "approve" else {})
+    return {"action": action, "params_json": json.dumps(params), "confidence": conf, "rationale": "test",
+            "lessons_used": used or []}
 
 
 def engine(tmp, decider=None, reasoner=None, executor=None, thresholds=None):
@@ -136,15 +137,41 @@ class TestEngine(unittest.TestCase):
         d = eng.decide(req())
         self.assertEqual(d["action"]["name"], "ask_human"); self.assertIn("interdit", d["rationale"])
 
+    def test_reasoner_concludes_after_decider_doubt(self):
+        eng = engine(self.tmp, decider=FakeLLM("d", [typed("approve", 0.4)]), reasoner=FakeLLM("r", [typed("escalate", 0.8)]))
+        d = eng.decide(req())
+        self.assertEqual((d["tier"], d["action"]["name"]), ("reasoner", "escalate"))
+
+    def test_idempotency_is_per_namespace_and_rule_decide_must_be_candidate(self):
+        eng = engine(self.tmp, decider=FakeLLM("d", [typed("approve"), typed("escalate"), typed("escalate")]))
+        a = eng.decide(req(idempotency_key="same", namespace="ns-a"))
+        b = eng.decide(req(idempotency_key="same", namespace="ns-b"))
+        self.assertEqual((a["namespace"], b["namespace"], "replayed" in b), ("ns-a", "ns-b", False))
+        (Path(self.tmp) / "ns-c").mkdir(parents=True)
+        (Path(self.tmp) / "ns-c/rules.json").write_text(json.dumps([{"id": "bad", "decide": {"name": "nuke"}}]))
+        d = eng.decide(req(namespace="ns-c"))
+        self.assertEqual(d["tier"], "decider"); self.assertEqual(d["action"]["name"], "escalate")
+
+    def test_unsupported_action_schema_and_bad_model_override_are_400s(self):
+        eng = engine(self.tmp, decider=FakeLLM("d", []))
+        with self.assertRaises(ValueError):
+            eng.decide(req(candidate_actions=[{"name": "x", "schema": {"anyOf": [{"type": "object"}]}}]))
+        with self.assertRaises(ValueError):
+            eng.decide(req(models={"decider": ["x"]}))
+
     def test_invalid_params_and_model_error_fall_through(self):
         eng = engine(self.tmp, decider=FakeLLM("d", [typed("approve", params={"limit": "beaucoup"})]),
+                     reasoner=FakeLLM("r", [LLMError("panne")]))
+        d0 = eng.decide(req(run_id="r0")); self.assertIn("paramètres invalides", d0["rationale"])
+        eng = engine(self.tmp, decider=FakeLLM("d", [{"action": "approve", "params_json": "pas du json", "confidence": 0.9,
+                                                        "rationale": "", "lessons_used": []}]),
                      reasoner=FakeLLM("r", [LLMError("panne")]))
         d = eng.decide(req())
         self.assertEqual(d["action"]["name"], "ask_human")
         self.assertIn("paramètres invalides", d["rationale"]); self.assertIn("panne", d["rationale"])
 
     def test_loop_guard(self):
-        eng = engine(self.tmp, decider=FakeLLM("d", [typed("escalate")] * 5), thresholds={"loop_max_repeats": 2})
+        eng = engine(self.tmp, decider=FakeLLM("d", [typed("escalate") for _ in range(5)]), thresholds={"loop_max_repeats": 2})
         eng.decide(req()); eng.decide(req())
         d = eng.decide(req())
         self.assertEqual((d["tier"], d["action"]["name"]), ("loop", "ask_human"))
@@ -168,13 +195,17 @@ class TestEngine(unittest.TestCase):
         out = eng.outcome({"decision_id": d["decision_id"], "result": "failure",
                            "human_feedback": {"correct_action": "escalate"}})
         self.assertEqual(pb.data["lessons"][0]["harmful"], 1)
+        dup = eng.outcome({"decision_id": d["decision_id"], "result": "failure"})
+        self.assertEqual((dup["recorded"], dup.get("duplicate"), pb.data["lessons"][0]["harmful"]), (False, True, 1))
+        with self.assertRaises(ValueError):
+            eng.outcome({"decision_id": d["decision_id"], "result": "failure", "human_feedback": {"correct_action": "nuke"}})
         self.assertEqual(len(out["lesson_proposals"]), 1)
         self.assertEqual(len(pb.data["pending"]), 1)
         rows = (Path(self.tmp) / "acme/invoices/dataset.jsonl").read_text().splitlines()
         self.assertEqual(json.loads(rows[0])["expected_action"], "escalate")
         # redémarrage : le journal est rechargé, l'outcome retrouve la décision
         eng2 = engine(self.tmp, decider=FakeLLM("d", []))
-        self.assertTrue(eng2.outcome({"decision_id": d["decision_id"], "result": "success"})["recorded"])
+        self.assertTrue(eng2.outcome({"decision_id": d["decision_id"], "result": "success"}).get("duplicate"))  # déjà noté, rechargé du journal
         with self.assertRaises(KeyError):
             eng2.outcome({"decision_id": "d_nope", "result": "success"})
 
@@ -202,7 +233,7 @@ class TestJev(unittest.TestCase):
         eng = Engine({"data_dir": tmp, "models": {}, "roles": {}}); eng.models["j"] = FakeJev(name="j"); eng.roles["decider"] = "j"
         d = eng.decide(req())
         self.assertEqual((d["tier"], d["action"]["name"], d["action"]["params"]), ("decider", "escalate", {}))
-        self.assertEqual(list(seen["q"]["action"]["criteria"]), ["approve", "escalate", "abstain"])
+        self.assertEqual(list(seen["q"]["action"]["criteria"]), ["approve", "escalate", "abstain", "ask_human"])
         # Jev choisit approve (qui exige limit) : params vides invalides → pas de raisonneur → humain
         FakeJev._ask = lambda self, s, q: ({"action": {"type": "choice", "choice": "approve", "confidence": 0.99, "probabilities": {}}}, {})
         d = eng.decide(req(run_id="r2"))
@@ -232,13 +263,20 @@ class TestPlaybook(unittest.TestCase):
         self.assertEqual(len(ids), 1)
         self.assertTrue(pb.approve(ids[0])); self.assertFalse(pb.reject(ids[0]))
         self.assertIn(ids[0], pb.render()[1])
+        # négation : pas un doublon ; id jamais réattribué après rejet ; rechargement si un autre processus écrit le fichier
+        n = pb.add("Approuver les factures de ACME.")
+        self.assertNotEqual(pb.add("Ne pas approuver les factures de ACME.")["id"], n["id"])
+        rid = pb.propose(["Leçon à rejeter."], source="x")[0]; pb.reject(rid)
+        self.assertNotEqual(pb.propose(["Leçon suivante."], source="x")[0], rid)
+        other = Playbook(pb.path); other.add("Leçon ajoutée par la CLI pendant que le serveur tourne.")
+        self.assertTrue(any("CLI" in l["text"] for l in pb.active()))
 
 
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
-        cls.dec = FakeLLM("d", [typed("approve")] * 20)
+        cls.dec = FakeLLM("d", [typed("approve") for _ in range(20)])
         server.Handler.engine = engine(cls.tmp, decider=cls.dec)
         server.Handler.token = "secret"
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -277,15 +315,86 @@ class TestServer(unittest.TestCase):
         self.assertFalse(r["result"]["isError"]); self.assertEqual(r["result"]["structuredContent"]["action"]["name"], "approve")
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "nope"}})
         self.assertIn("error", r)
+        self.assertEqual(self.call("GET", "/mcp")[0], 405)
+        self.assertEqual(self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 5})[1]["error"]["code"], -32600)
+        self.assertEqual(self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": 3})[1]["error"]["code"], -32602)
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/mcp", "{}", {"Authorization": "Bearer secret", "Origin": "https://evil.example"})
+        self.assertEqual(c.getresponse().status, 403)
 
     def test_claude_hook_gate_and_context(self):
-        self.dec.answers.insert(0, typed("allow", params={}))
-        st, r = self.call("POST", "/hooks/claude", {"hook_event_name": "PreToolUse", "session_id": "s1", "cwd": "/tmp/proj",
-                                                     "tool_name": "Bash", "tool_input": {"command": "rm -rf /"}, "tool_use_id": "t1"})
-        self.assertEqual(r["hookSpecificOutput"]["permissionDecision"], "allow")  # le faux décideur dit approve → mappé allow
-        server.Handler.engine.playbook("claude/proj").add("Ne jamais lancer rm -rf sans confirmation.")
-        st, r = self.call("POST", "/hooks/claude", {"hook_event_name": "SessionStart", "cwd": "/tmp/proj"})
+        # le faux décideur répond "allow" (dans l'enum du hook) : mappé sur permissionDecision allow
+        self.dec.answers[:0] = [typed("allow", params={}) for _ in range(6)]
+        hook = {"hook_event_name": "PreToolUse", "session_id": "s1", "cwd": "/tmp/My Projet é", "tool_name": "Bash",
+                "tool_input": {"command": "ls"}, "tool_use_id": "t1"}
+        st, r = self.call("POST", "/hooks/claude", hook)
+        self.assertEqual((st, r["hookSpecificOutput"]["permissionDecision"]), (200, "allow"))
+        # 5 appels différents dans la même session ne déclenchent pas l'anti-boucle (empreinte de l'entrée dans le point)
+        for i in range(5):
+            st, r = self.call("POST", "/hooks/claude", {**hook, "tool_input": {"command": f"ls {i}"}, "tool_use_id": f"t{i+2}"})
+            self.assertEqual(r["hookSpecificOutput"]["permissionDecision"], "allow", i)
+        self.assertEqual(server.hook_namespace("/tmp/My Projet é"), "My_Projet__")
+        self.assertEqual(server.hook_namespace("/"), "default")
+        server.Handler.engine.playbook("claude/My_Projet__").add("Ne jamais lancer rm -rf sans confirmation.")
+        st, r = self.call("POST", "/hooks/claude", {"hook_event_name": "UserPromptSubmit", "cwd": "/tmp/My Projet é"})
         self.assertIn("rm -rf", r["hookSpecificOutput"]["additionalContext"])
+
+
+class TestLLMClient(unittest.TestCase):
+    """Le client urllib contre un faux fournisseur OpenAI local : 429 puis 200, contenu vide, troncature, json_object."""
+    @classmethod
+    def setUpClass(cls):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        cls.seen, cls.script = [], []
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                cls.seen.append((self.headers.get("Authorization"), body))
+                code, payload = cls.script.pop(0)
+                data = json.dumps(payload).encode()
+                self.send_response(code); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        cls.srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    @staticmethod
+    def ok(content, finish="stop"):
+        return 200, {"choices": [{"message": {"content": content}, "finish_reason": finish}], "usage": {"total_tokens": 3}}
+
+    def test_retry_json_modes_and_errors(self):
+        from reason.llm import LLM
+        llm = LLM(self.url, "m", api_key="k", json_schema=False, temperature=None, max_tokens_key="max_completion_tokens",
+                  extra={"reasoning": {"effort": "low"}})
+        self.script[:] = [(429, {"error": "slow down"}), self.ok('{"a": 1}')]
+        out, usage = llm.chat([{"role": "system", "content": "S"}, {"role": "user", "content": "U"}], schema={"type": "object"})
+        self.assertEqual(out, {"a": 1})
+        auth, body = self.seen[-1]
+        self.assertEqual(auth, "Bearer k"); self.assertNotIn("temperature", body); self.assertIn("max_completion_tokens", body)
+        self.assertEqual(body["response_format"], {"type": "json_object"}); self.assertEqual(body["reasoning"], {"effort": "low"})
+        self.assertEqual(body["messages"][0]["role"], "system"); self.assertIn("schéma JSON", body["messages"][0]["content"])
+        self.assertEqual(len(body["messages"]), 2)
+        strict = LLM(self.url, "m", json_schema=True)
+        self.script[:] = [self.ok('```json\n{"b": 2}\n```')]
+        self.assertEqual(strict.chat([{"role": "user", "content": "U"}], schema={"type": "object"})[0], {"b": 2})
+        self.assertEqual(self.seen[-1][1]["response_format"]["json_schema"]["strict"], True)
+        self.script[:] = [self.ok("", "stop"), self.ok("", "stop")]
+        with self.assertRaisesRegex(LLMError, "contenu vide"):
+            strict.chat([{"role": "user", "content": "U"}], schema={"type": "object"})
+        self.script[:] = [self.ok('{"c":', "length")]
+        with self.assertRaisesRegex(LLMError, "tronquée"):
+            strict.chat([{"role": "user", "content": "U"}], schema={"type": "object"})
+        self.script[:] = [(400, {"error": "bad"})]
+        with self.assertRaisesRegex(LLMError, "HTTP 400"):
+            strict.chat([{"role": "user", "content": "U"}])
+        self.assertEqual(len(self.script), 0)   # un 400 n'est pas retenté
+        with self.assertRaises(ValueError):
+            LLM.from_config("x", {"base_url": self.url, "model": "m", "temprature": 0})
 
 
 class TestCheckDiff(unittest.TestCase):

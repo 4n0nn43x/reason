@@ -1,9 +1,10 @@
 """Adaptateur Jev (TypeSafe AI) : modèle de décision typée, pas un LLM. Même interface chat() que LLM,
-donc utilisable sur n'importe quel rôle via {"provider": "jev"}. Même format chez TypeSafe, OpenRouter
+donc utilisable comme décideur via {"provider": "jev"}. Même format chez TypeSafe, OpenRouter
 (base_url https://openrouter.ai/api, model jev-latest) et Vercel (base_url https://ai-gateway.vercel.sh/typesafe, model typesafe-ai/jev).
 
 Limites connues : Jev ne produit pas de paramètres d'action (params = {}), donc une action qui exige des paramètres
-sera escaladée au raisonneur ; il n'explique pas (rationale = probabilités) ; state texte, 32k tokens max.
+est escaladée au raisonneur ; il n'explique pas (rationale = probabilités) ; rôle décideur uniquement (pas exécuteur
+ni reflector) ; state texte, 32k tokens max.
 """
 from __future__ import annotations
 
@@ -19,30 +20,36 @@ from .llm import LLMError
 
 class JevDecider:
     def __init__(self, base_url: str = "https://api.typesafe.ai", model: str = "jev-latest", api_key: str | None = None,
-                 api_key_env: str | None = "TYPESAFE_API_KEY", timeout: int = 20, name: str = "jev", **_ignored):
+                 api_key_env: str | None = "TYPESAFE_API_KEY", timeout: int = 20, name: str = "jev"):
         self.base_url, self.model, self.timeout, self.name = base_url.rstrip("/"), model, timeout, name
         self.api_key = api_key or (os.environ.get(api_key_env) if api_key_env else None)
 
-    def chat(self, messages: list[dict], schema: dict | None = None, temperature: float = 0.0,
+    def chat(self, messages: list[dict], schema: dict | None = None, temperature: float | None = None,
              max_tokens: int | None = None, retries: int = 1) -> tuple[dict | str, dict]:
         system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         user = "\n".join(m["content"] for m in messages if m["role"] == "user")
-        if schema is None:  # empreinte / usage libre : une question noul sur le texte
+        if schema is None:  # empreinte : une question noul sur le texte
             ans, usage = self._ask(user, {"q": {"type": "noul", "instructions": "The statement in the state is true."}})
-            return str(ans["q"].get("noul")), usage
-        names = [n for n in schema["properties"]["action"]["enum"] if n not in META_ACTIONS]
+            return str(ans.get("q", {}).get("noul")), usage
+        try:
+            names = [n for n in schema["properties"]["action"]["enum"] if n not in META_ACTIONS]
+        except (KeyError, TypeError):
+            raise LLMError(f"{self.name}: Jev ne sert que de décideur (schéma de décision attendu)") from None
         try:
             req = json.loads(user)
-            criteria = {a["name"]: a.get("description") for a in req.get("candidate_actions", []) if a["name"] in names}
-        except (ValueError, TypeError, KeyError):
-            criteria = {}
-        criteria = {n: criteria.get(n) for n in names}
+            desc = {a["name"]: a.get("description") or "" for a in req.get("candidate_actions", [])}
+        except (ValueError, TypeError, KeyError, AttributeError):
+            desc = {}
+        criteria = {n: desc.get(n, "") for n in names}
         criteria["abstain"] = "None of the actions clearly applies, or more information is needed"
+        criteria["ask_human"] = "A human must decide: high stakes, irreversible, or outside the policy"
         ans, usage = self._ask(user, {"action": {"type": "choice", "instructions": system[:8000], "criteria": criteria}})
-        a = ans["action"]
-        probs = a.get("probabilities", {})
-        return {"action": a["choice"], "params": {}, "confidence": float(a.get("confidence", 0.0)),
-                "rationale": "jev " + json.dumps(probs, ensure_ascii=False), "lessons_used": []}, usage
+        try:
+            a = ans["action"]
+            return {"action": a["choice"], "params_json": "{}", "confidence": float(a.get("confidence", 0.0)),
+                    "rationale": "jev " + json.dumps(a.get("probabilities", {}), ensure_ascii=False), "lessons_used": []}, usage
+        except (KeyError, TypeError, ValueError) as e:
+            raise LLMError(f"{self.name}: réponse inattendue {e}") from None
 
     def _ask(self, state: str, questions: dict) -> tuple[dict, dict]:
         body = json.dumps({"model": self.model, "state": state, "questions": questions}).encode()

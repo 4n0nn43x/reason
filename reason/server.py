@@ -6,35 +6,30 @@ Stdlib uniquement (ThreadingHTTPServer).
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
 import sys
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import __version__
-from .core import Engine
+from .core import EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine
 from .llm import LLMError
 
 MAX_BODY = 1_000_000
+MAX_TOOL_INPUT_CHARS = 4000
 MCP_TOOLS = [
     {"name": "decide", "description": "Prend une décision bornée pour une automatisation (règles → modèle → humain). "
-                                      "Retourne action, confiance, besoin d'humain.",
-     "inputSchema": {"type": "object", "required": ["namespace", "decision_point", "candidate_actions"],
-                     "properties": {"namespace": {"type": "string"}, "run_id": {"type": "string"},
-                                    "decision_point": {"type": "string"}, "event": {}, "state": {},
-                                    "history": {"type": "array"}, "candidate_actions": {"type": "array"},
-                                    "constraints": {"type": "object"}, "idempotency_key": {"type": "string"}}}},
+                                      "Retourne action, confiance, besoin d'humain.", "inputSchema": REQUEST_SCHEMA},
     {"name": "outcome", "description": "Rapporte le résultat réel d'une décision (success|failure|unknown) pour l'apprentissage.",
-     "inputSchema": {"type": "object", "required": ["decision_id", "result"],
-                     "properties": {"decision_id": {"type": "string"}, "result": {"type": "string"},
-                                    "metrics": {"type": "object"}, "human_feedback": {"type": "object"},
-                                    "detail": {"type": "string"}}}},
+     "inputSchema": OUTCOME_SCHEMA},
     {"name": "execute", "description": "Exécute une tâche de texte/extraction avec le modèle exécuteur et les leçons du namespace.",
-     "inputSchema": {"type": "object", "required": ["namespace", "task"],
-                     "properties": {"namespace": {"type": "string"}, "task": {"type": "string"}, "input": {},
-                                    "output_schema": {"type": "object"}}}},
+     "inputSchema": EXECUTE_SCHEMA},
 ]
 
 
@@ -49,6 +44,7 @@ class Handler(BaseHTTPRequestHandler):
     engine: Engine
     token: str | None
     server_version = f"Reason/{__version__}"
+    timeout = 30   # un client qui annonce un Content-Length et n'envoie rien ne tient pas un thread indéfiniment
 
     def log_message(self, fmt, *args):  # journal compact
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
@@ -75,11 +71,22 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         if not self.token:
             return True
-        return self.headers.get("Authorization") == f"Bearer {self.token}"
+        return hmac.compare_digest(self.headers.get("Authorization") or "", f"Bearer {self.token}")
+
+    def _origin_ok(self) -> bool:
+        """Anti DNS rebinding (MCP) : un Origin présent doit être local ou dans REASON_ALLOWED_ORIGINS."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = (urlparse(origin).hostname or "").lower()
+        allowed = {h.strip().lower() for h in os.environ.get("REASON_ALLOWED_ORIGINS", "").split(",") if h.strip()}
+        return host in {"localhost", "127.0.0.1", "::1"} | allowed
 
     def do_GET(self):
         if self.path == "/health":
-            return self._json(200, {"ok": True, "version": __version__, "roles": self.engine.roles})
+            return self._json(200, {"ok": True, "version": __version__})
+        if self.path == "/mcp":
+            return self._json(405, {"error": "pas de flux SSE : utiliser POST"})
         if not self._authed():
             return self._json(401, {"error": "non autorisé"})
         if self.path.startswith("/lessons/"):
@@ -88,12 +95,14 @@ class Handler(BaseHTTPRequestHandler):
                 pb = self.engine.playbook(ns)
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
-            return self._json(200, {"namespace": ns, "lessons": pb.active(), "pending": pb.data["pending"]})
+            return self._json(200, {"namespace": ns, "lessons": pb.active(), "pending": pb.pending()})
         self._json(404, {"error": "inconnu"})
 
     def do_POST(self):
         if not self._authed():
             return self._json(401, {"error": "non autorisé"})
+        if not self._origin_ok():
+            return self._json(403, {"error": "origine refusée"})
         try:
             body = self._body()
             if self.path == "/decide":
@@ -117,11 +126,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- façade MCP (JSON-RPC 2.0 sur POST, stateless : aucune session requise)
     def _mcp(self, msg: dict):
-        rid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
-        if method is None and "id" not in msg:
-            return self._json(400, {"error": "JSON-RPC attendu"})
-        if method and method.startswith("notifications/"):
+        rid, method, params = msg.get("id"), msg.get("method"), msg.get("params")
+        if not isinstance(method, str):
+            return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": "requête JSON-RPC invalide"}})
+        if method.startswith("notifications/"):
             self.send_response(202); self.end_headers(); return
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "params doit être un objet"}})
         try:
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-11-25"),
@@ -134,8 +147,8 @@ class Handler(BaseHTTPRequestHandler):
             elif method == "tools/call":
                 name, args = params.get("name"), params.get("arguments") or {}
                 fn = {"decide": self.engine.decide, "outcome": self.engine.outcome, "execute": self.engine.execute}.get(name)
-                if fn is None:
-                    return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"outil inconnu {name}"}})
+                if fn is None or not isinstance(args, dict):
+                    return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"outil inconnu ou arguments invalides: {name}"}})
                 try:
                     out = fn(args)
                     result = {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}],
@@ -152,11 +165,14 @@ class Handler(BaseHTTPRequestHandler):
     # --- hook http Claude Code : le gate « décider avant l'action »
     def _claude_hook(self, h: dict) -> dict:
         ev = h.get("hook_event_name")
-        ns = os.environ.get("REASON_HOOK_NAMESPACE") or ("claude/" + Path(h.get("cwd") or "default").name)
+        ns = os.environ.get("REASON_HOOK_NAMESPACE") or "claude/" + hook_namespace(h.get("cwd"))
         if ev == "PreToolUse":
+            tool_input = json.dumps(h.get("tool_input"), ensure_ascii=False)[:MAX_TOOL_INPUT_CHARS]
+            # le point de décision inclut l'empreinte de l'entrée : l'anti-boucle ne vise que la répétition du même appel
+            point = f"tool:{h.get('tool_name')}:{hashlib.sha1(tool_input.encode()).hexdigest()[:8]}"
             dec = self.engine.decide({
-                "namespace": ns, "run_id": h.get("session_id"), "decision_point": f"tool:{h.get('tool_name')}",
-                "event": {"type": "tool_call", "tool_name": h.get("tool_name"), "tool_input": h.get("tool_input")},
+                "namespace": ns, "run_id": h.get("session_id"), "decision_point": point,
+                "event": {"type": "tool_call", "tool_name": h.get("tool_name"), "tool_input": tool_input},
                 "state": {"cwd": h.get("cwd"), "permission_mode": h.get("permission_mode")},
                 "candidate_actions": [{"name": "allow", "schema": {"type": "object", "additionalProperties": False}},
                                       {"name": "deny", "schema": {"type": "object", "additionalProperties": False}}],
@@ -171,6 +187,11 @@ class Handler(BaseHTTPRequestHandler):
                 return {}
             return {"hookSpecificOutput": {"hookEventName": ev, "additionalContext": "Leçons Reason pour ce projet :\n" + text}}
         return {}
+
+
+def hook_namespace(cwd: str | None) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(cwd or "").name).lstrip("._-")
+    return name or "default"
 
 
 def serve(config: dict, host: str = "127.0.0.1", port: int = 8787) -> None:
