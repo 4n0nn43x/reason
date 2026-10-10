@@ -251,7 +251,7 @@ python -m reason poll --loop     # toutes les 5 minutes
 python -m reason outcomes trader/delphi --horizon-hours 48   # taux de succès sur la cohorte mûre, couverture des labels, retard du poller
 ```
 
-Le poller lit un JSONL local, un endpoint HTTP JSON ou un subgraph GraphQL depuis un watermark persisté, mappe les champs par configuration, apparie chaque règlement aux décisions en attente via la `correlation_key` fournie au moment de la décision et une fenêtre temporelle, et déclare `unknown` les décisions dont l'horizon est dépassé. Voir `examples/reason.config.v02.json` pour le `events.jsonl` d'un trader et l'API de résolutions de Polymarket.
+Le poller lit un JSONL local, un endpoint HTTP JSON ou un subgraph GraphQL depuis un watermark persisté, mappe les champs par configuration, apparie chaque règlement aux décisions en attente via la `correlation_key` fournie au moment de la décision et une fenêtre temporelle, et déclare `unknown` les décisions dont l'horizon est dépassé. Un type d'événement qui n'est ni un résultat valide, ni dans `result_map`, ni dans `ignore` n'est **jamais** converti en `unknown` : cela retirerait silencieusement les pertes du score et rendrait toutes les sources faussement bonnes. Il est mis de côté, compté sous `unmapped` dans le rapport, signalé, et retraité dès que la configuration est corrigée. Voir `examples/reason.config.v02.json` pour le `events.jsonl` d'un trader et l'API de résolutions de Polymarket.
 
 ### Règles v2
 
@@ -359,7 +359,7 @@ reason/
   __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
-tests/test_reason.py         44 tests hors ligne
+tests/test_reason.py         45 tests hors ligne
 ```
 
 ```bash

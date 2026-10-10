@@ -305,7 +305,7 @@ python -m reason outcomes trader/delphi --horizon-hours 48   # معدل النج
 
 <div dir="rtl">
 
-يقرأ المُستطلِع ملف JSONL محلياً أو نقطة HTTP JSON أو subgraph بلغة GraphQL انطلاقاً من علامة مائية محفوظة، ويطابق الحقول عبر الإعدادات، ويربط كل تسوية بالقرارات المعلّقة عبر `correlation_key` الذي مرّرته وقت القرار ونافذة زمنية، ويعلن القرارات التي تجاوزت أفقها `unknown`. انظر `examples/reason.config.v02.json` لملف `events.jsonl` الخاص بمتداول ولواجهة تسويات Polymarket.
+يقرأ المُستطلِع ملف JSONL محلياً أو نقطة HTTP JSON أو subgraph بلغة GraphQL انطلاقاً من علامة مائية محفوظة، ويطابق الحقول عبر الإعدادات، ويربط كل تسوية بالقرارات المعلّقة عبر `correlation_key` الذي مرّرته وقت القرار ونافذة زمنية، ويعلن القرارات التي تجاوزت أفقها `unknown`. نوع الحدث الذي ليس نتيجة صالحة ولا موجوداً في `result_map` ولا في `ignore` **لا** يُحوَّل أبداً إلى `unknown`: فذلك يُسقط الخسائر من التقييم بصمت ويجعل كل المصادر تبدو جيدة. يُحتفظ به جانباً، ويُعدّ تحت `unmapped` في تقرير التمريرة مع تحذير، ويُعاد معالجته حين تُصحَّح الإعدادات. انظر `examples/reason.config.v02.json` لملف `events.jsonl` الخاص بمتداول ولواجهة تسويات Polymarket.
 
 ### القواعد v2
 
@@ -435,7 +435,7 @@ reason/
   __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
-tests/test_reason.py         44 اختباراً دون شبكة
+tests/test_reason.py         45 اختباراً دون شبكة
 ```
 
 ```bash

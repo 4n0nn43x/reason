@@ -791,6 +791,27 @@ class TestReviewFindings(unittest.TestCase):
         self.assertIn("L-001", ids)
 
 
+class TestPollerUnmapped(unittest.TestCase):
+    def test_unknown_event_types_are_held_not_scored_and_recovered_after_config_fix(self):
+        from reason import poller
+        tmp = Path(tempfile.mkdtemp())
+        eng = engine(str(tmp / "data"), decider=FakeLLM("d", [typed("approve") for _ in range(3)]))
+        d_win = eng.decide(req(correlation_key="m:1")); d_loss = eng.decide(req(correlation_key="m:2", run_id="r2"))
+        events = tmp / "ev.jsonl"
+        events.write_text("\n".join(json.dumps(x) for x in (
+            {"type": "REDEEM", "market": "m:1"}, {"type": "POSITION_LOST", "market": "m:2"}, {"type": "BUY", "market": "m:2"})) + "\n")
+        src = {"name": "ev", "namespace": "acme/invoices", "type": "jsonl", "path": str(events),
+               "fields": {"correlation_key": "market", "result": "type"}, "result_map": {"REDEEM": "success"}, "ignore": ["BUY"]}
+        r = poller.tick(eng, src, tmp / "st.json")
+        self.assertEqual([x["decision_id"] for x in r["posted"]], [d_win["decision_id"]])
+        self.assertEqual(r["unmapped"], {"POSITION_LOST": 1})                  # la perte n'est PAS devenue unknown
+        self.assertNotIn(d_loss["decision_id"], eng._outcomes)
+        src["result_map"]["POSITION_LOST"] = "failure"                         # configuration corrigée
+        r2 = poller.tick(eng, src, tmp / "st.json")
+        self.assertEqual(([x["decision_id"] for x in r2["posted"]], r2["unmapped"]), ([d_loss["decision_id"]], {}))
+        self.assertEqual(eng._outcomes[d_loss["decision_id"]]["result"], "failure")
+
+
 class TestCheckDiff(unittest.TestCase):
     def test_detects_test_tampering(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "check_diff.py"

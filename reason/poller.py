@@ -7,7 +7,11 @@ Sources (config["poller"]["sources"][i]) :
    "path" (jsonl) | "url", "headers", "query" (graphql), "items": "chemin.vers.liste", "cursor": "champ",
    "fields": {"correlation_key": "...", "result": "...", "result_detail": "...", "value": "...", "payout_fraction": "...",
               "settled_at": "...", "ref": "...", "resolution_text": "...", "label_confidence": 0.9},
-   "result_map": {"win": "success", "loss": "failure", "refund": "void", "no_outcome": "no_outcome"}}
+   "result_map": {"win": "success", "loss": "failure", "refund": "void", "no_outcome": "no_outcome"},
+   "ignore": ["BUY", "SELL"]}
+Un type d'événement qui n'est ni un résultat valide, ni dans `result_map`, ni dans `ignore` n'est JAMAIS converti en
+`unknown` (cela exclurait silencieusement des pertes du score, biais du survivant) : il est gardé de côté, compté dans le
+rapport du tick (`unmapped`), signalé sur stderr, et retraité à chaque tick avec la configuration courante.
 Chaque entrée de `fields` est un chemin dans l'item source, ou une constante si la valeur n'est pas une chaîne.
 Stdlib seulement. Pas de broker, pas de base : l'état tient dans poller_state.json.
 """
@@ -90,12 +94,16 @@ def normalize(src: dict, item: dict, position) -> dict | None:
     if key is None:
         return None
     raw = _val(item, f.get("result", "result"))
+    if raw is not None and str(raw) in {str(x) for x in src.get("ignore", [])}:
+        return None
     result = (src.get("result_map") or {}).get(str(raw), raw)
+    if result not in VALID_RESULTS:
+        return {"_unmapped": str(raw)}
     detail = _val(item, f.get("result_detail")) or (str(raw) if raw is not None else None)
     ref = _val(item, f.get("ref")) or (f"{src['name']}:{position}" if position is not None else
                                          f"{src['name']}:" + hashlib.sha1(json.dumps(item, sort_keys=True).encode()).hexdigest()[:16])
     settled = _val(item, f.get("settled_at", "settled_at"))
-    out = {"correlation_key": str(key), "result": result if result in VALID_RESULTS else "unknown",
+    out = {"correlation_key": str(key), "result": result,
            "result_detail": detail, "value": _val(item, f.get("value")), "payout_fraction": _val(item, f.get("payout_fraction")),
            "settled_at": settled, "observed_at": datetime.now(timezone.utc).isoformat(),
            "source": src["name"], "source_ref": str(ref), "label_confidence": _val(item, f.get("label_confidence", 1.0)),
@@ -132,6 +140,7 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
     st = state.setdefault(src["name"], {"watermark": None, "last_run": None})
     pending = engine.pending(ns)
     posted, skipped, errors = [], [], []
+    unmapped: dict[str, int] = {}
     if src["type"] == "jsonl":
         path = Path(src["path"])
         offset = int(st.get("watermark") or 0)
@@ -144,14 +153,25 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
     ttl = src.get("match_ttl_hours", 720)
     # événements déjà lus mais pas encore appariés (décision prise plus tard, ou autre processus) : réessayés jusqu'au TTL
     queue = [(u["outcome"], u["seen"]) for u in st.get("unmatched", [])]
-    for item, pos in events:
+    # événements de type inconnu : retraités avec la configuration courante (une correction de result_map les récupère)
+    held = st.get("unmapped_events", [])
+    still_held = []
+    for item, pos in [(h["item"], h["pos"]) for h in held] + [(item, pos) for item, pos in events]:
         o = normalize(src, item, pos)
         if o is None:
             skipped.append(pos)
+        elif "_unmapped" in o:
+            unmapped[o["_unmapped"]] = unmapped.get(o["_unmapped"], 0) + 1
+            still_held.append({"item": item, "pos": pos})
         else:
             queue.append((o, now.isoformat()))
+    st["unmapped_events"] = still_held[-MAX_UNMATCHED:]
+    if unmapped:
+        print(f"avertissement: source {src['name']} : types d'événement sans correspondance (ni result_map ni ignore), "
+              f"non comptés : {unmapped}", file=sys.stderr)
+    for item, pos in events:
         if src["type"] == "jsonl":
-            new_wm = pos                                   # offset d'octets : avance même sur une ligne ignorée
+            new_wm = pos                                   # offset d'octets : les types inconnus sont gardés dans l'état
         elif pos is not None and (new_wm is None or _newer(pos, new_wm)):
             new_wm = pos
     unmatched = []
@@ -183,7 +203,8 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
     st["watermark"], st["last_run"] = new_wm, now.isoformat()
     tmp = state_path.with_suffix(".tmp"); tmp.write_text(json.dumps(state, indent=1)); os.replace(tmp, state_path)
     return {"source": src["name"], "namespace": ns, "events": len(events), "posted": posted, "expired": expired,
-            "skipped": len(skipped), "unmatched": len(st["unmatched"]), "errors": errors, "watermark": new_wm}
+            "skipped": len(skipped), "unmatched": len(st["unmatched"]), "unmapped": unmapped, "errors": errors,
+            "watermark": new_wm}
 
 
 def run(engine, config: dict, once: bool = True, interval_s: int = 300) -> list[dict]:

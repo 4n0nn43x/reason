@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-10-10)
+
+### Fixed
+- **Poller survivorship bias**: an event type that is neither a valid result, nor in `result_map`, nor in the new `ignore` list used to become `unknown`, which silently excluded unmapped losses from every score. It is now held in the poller state, counted under `unmapped` in the tick report, warned about on stderr, and reprocessed with the current config at each tick, so fixing `result_map` recovers it.
+- Examples: removed the `no-fallback-clause` rule, which encoded a domain opinion (a missing fallback clause can be an edge, not a reason to refuse); the example `result_map` now maps a loss event and ignores trade events.
+
 ## 0.2.0 (2026-10-10)
 
 Driven by an external review from a prediction-market trader (see the research notes): from "which action" to "how likely, scored at settlement".

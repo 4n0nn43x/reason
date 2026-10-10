@@ -251,7 +251,7 @@ python -m reason poll --loop     # 每 5 分钟一次
 python -m reason outcomes trader/delphi --horizon-hours 48   # 成熟样本上的成功率、标签覆盖率、轮询延迟
 ```
 
-轮询器从持久化水位线开始读取本地 JSONL、HTTP JSON 接口或 GraphQL subgraph，按配置映射字段，依据决策时传入的 `correlation_key` 和时间窗口把每笔结算匹配到待定决策，并把超过时限的决策标记为 `unknown`。交易者的 `events.jsonl` 与 Polymarket 结算 API 的配置见 `examples/reason.config.v02.json`。
+轮询器从持久化水位线开始读取本地 JSONL、HTTP JSON 接口或 GraphQL subgraph，按配置映射字段，依据决策时传入的 `correlation_key` 和时间窗口把每笔结算匹配到待定决策，并把超过时限的决策标记为 `unknown`。 既不是有效结果、也不在 `result_map` 或 `ignore` 中的事件类型**绝不会**被转成 `unknown`：那会悄悄把亏损排除在评分之外，让所有来源看起来都很好。它会被暂存，在轮询报告的 `unmapped` 中计数并发出警告，配置修正后自动重新处理。交易者的 `events.jsonl` 与 Polymarket 结算 API 的配置见 `examples/reason.config.v02.json`。
 
 ### 规则 v2
 
@@ -359,7 +359,7 @@ reason/
   __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
-tests/test_reason.py         44 个离线测试
+tests/test_reason.py         45 个离线测试
 ```
 
 ```bash
