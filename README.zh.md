@@ -11,6 +11,8 @@
 
 `Python ≥ 3.11` · `零依赖` · `MIT` · `HTTP · MCP · Claude Code 钩子`
 
+版本说明与历史：[CHANGELOG.md](CHANGELOG.md)。
+
 </div>
 
 ---
@@ -197,9 +199,9 @@ python -m reason lessons acme/invoices approve L-003
 
 当动作是有效候选时，`decide` 直接绕过模型（0 毫秒，0 美元）。`forbid` 否决模型的输出：该动作落到下一层，再到人类。运算符：`eq ne gt gte lt lte in nin contains exists regex`。供模型阅读的自然语言策略放在 `policy.md`。
 
-## 0.2 新增：从选择到可评分的估计
+## 可评分的估计、延迟结果、规则与经验
 
-Reason 0.1 回答*选哪个动作*。0.2 还回答*可能性有多大*，并在现实结果揭晓时给这个回答打分。以下全部可选，且向后兼容。
+除了*选哪个动作*，Reason 还可以回答*可能性有多大*，并在现实结果揭晓时给这个回答打分。本节内容全部可选。
 
 ```mermaid
 flowchart LR
@@ -211,7 +213,7 @@ flowchart LR
     R --> A
     S[(结算来源<br/>JSONL · HTTP · subgraph)] -- reason poll --> O[POST /outcome v2<br/>或 /estimate/outcome]
     O --> B[Brier · log-loss · RPS<br/>按命名空间、来源、经验]
-    B -- reason calibrate --fit --> C
+    B -->|"reason calibrate"| C
     B --> L[(经验计数器)]
 ```
 
@@ -332,10 +334,10 @@ python -m reason fingerprint                 # 每个模型的确定性指纹；
 
 ## 不提供自我修改的智能体
 
-早期版本附带一个每周运行、为 Reason 自身提出补丁的维护工作流。0.3 中已将其移除：它在 CI 运行器上没有任何数据可读，而且它运行的测试仍会导入刚被它修改的代码，补丁完全可以操纵测试结果。这正是 Reason 要防止的失败模式。`scripts/check_diff.py` 仍保留为独立的 CI 检查：在任何 pull request 中标记被改动的测试文件、新增的 `skip`/`xfail` 标记以及被删除的断言。
+Reason 不提供任何会修改自身代码或测试的智能体：能编辑评分标准的模型终究会操纵评分。`scripts/check_diff.py` 是独立的 CI 检查，会在任何 pull request 中标记被改动的测试文件、新增的 `skip`/`xfail` 标记以及被删除的断言。
 ## 证明它有效
 
-三份独立评审得出同一个结论：合法的 JSON 决策不等于正确的决策，模型自报的置信度也没有经过校准。0.3 增加了度量工具，而不仅仅是断言。
+合法的 JSON 决策不等于正确的决策，模型自报的置信度也没有经过校准。Reason 用度量代替断言。
 
 **决策置信度校准。** 每个由模型做出的决策的结果，都会以（置信度，是否正确）记录到 `decision_scores.jsonl`。然后：
 
@@ -366,8 +368,8 @@ python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after
 - 经验绝不由模型直接写入：提案进入待审队列，由人工批准。每条经验上限 300 字符。
 - `state`、`event`、工具输入都是不可信数据。提示词会声明这一点，但提示注入仍然可能：把不可逆动作放在 P0 规则或 `ask_human` 之后。
 - 每个命名空间有只追加的日志（`DecisionMade`、`OutcomeRecorded`、`Executed`），启动时重新加载。来自 Claude Code 钩子的工具输入在记录前截断到 4 000 字符。
-- 0.3：没有认证时服务器拒绝启动（`serve --insecure` 仅允许在本地回环地址上使用）。除管理员 `REASON_TOKEN` 外，`config.tokens` 把密钥映射到命名空间（glob 模式）和作用域（`decide`、`outcome`、`execute`、`estimate`、`read`），在 HTTP、MCP 与钩子中都会校验。每个 `data_dir` 只允许一个 `reason serve`（文件锁）。经验手册与日志的写入在进程之间加锁。
-- 0.3：`redact_paths`（例如 `state.facts.iban`，仅限 `event`、`state`、`history`、`context`、`ruling_text`、`input`）会在所有持久化内容（日志、数据集、评分）中屏蔽敏感字段，而模型仍能看到完整请求；模型理由等自由文本不会被屏蔽；`reason prune <ns> --days N` 删除旧日志事件，仍在等待结果的决策除外。
+- 没有认证时服务器拒绝启动（`serve --insecure` 仅允许在本地回环地址上使用）。除管理员 `REASON_TOKEN` 外，`config.tokens` 把密钥映射到命名空间（glob 模式）和作用域（`decide`、`outcome`、`execute`、`estimate`、`read`），在 HTTP、MCP 与钩子中都会校验。每个 `data_dir` 只允许一个 `reason serve`（文件锁）。经验手册与日志的写入在进程之间加锁。
+- `redact_paths`（例如 `state.facts.iban`，仅限 `event`、`state`、`history`、`context`、`ruling_text`、`input`）会在所有持久化内容（日志、数据集、评分）中屏蔽敏感字段，而模型仍能看到完整请求；模型理由等自由文本不会被屏蔽；`reason prune <ns> --days N` 删除旧日志事件，仍在等待结果的决策除外。
 
 ## 项目结构
 

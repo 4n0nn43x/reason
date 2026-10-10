@@ -11,6 +11,8 @@ Les règles déterministes d'abord, un décideur typé bon marché ensuite, un m
 
 `Python ≥ 3.11` · `zéro dépendance` · `MIT` · `HTTP · MCP · hooks Claude Code`
 
+Notes de version et historique : [CHANGELOG.md](CHANGELOG.md).
+
 </div>
 
 ---
@@ -197,9 +199,9 @@ La réponse porte toujours `tier` (`rules`, `decider`, `reasoner`, `loop`, `esca
 
 `decide` court-circuite les modèles (0 ms, 0 $) quand l'action est une candidate valide. `forbid` oppose un veto à la sortie des modèles : l'action passe au palier suivant, puis à l'humain. Opérateurs : `eq ne gt gte lt lte in nin contains exists regex`. La politique en prose, lue par les modèles, va dans `policy.md`.
 
-## Nouveau en 0.2 : des choix aux estimations scorées
+## Estimations scorées, issues différées, règles et leçons
 
-Reason 0.1 répondait *quelle action*. La 0.2 répond aussi *avec quelle probabilité*, et note cette réponse quand la réalité tranche. Tout ce qui suit est optionnel et rétro-compatible.
+Au-delà de *quelle action*, Reason peut répondre *avec quelle probabilité*, et noter cette réponse quand la réalité tranche. Tout ce qui suit dans cette section est optionnel.
 
 ```mermaid
 flowchart LR
@@ -211,7 +213,7 @@ flowchart LR
     R --> A
     S[(Source de règlement<br/>JSONL · HTTP · subgraph)] -- reason poll --> O[POST /outcome v2<br/>ou /estimate/outcome]
     O --> B[Brier · log-loss · RPS<br/>par namespace, source, leçon]
-    B -- reason calibrate --fit --> C
+    B -->|"reason calibrate"| C
     B --> L[(Compteurs des leçons)]
 ```
 
@@ -332,10 +334,10 @@ python -m reason fingerprint                 # signature déterministe par modè
 
 ## Pas d'agent qui se modifie
 
-Les versions précédentes livraient un workflow hebdomadaire qui proposait des patchs à Reason lui-même. Il a été retiré en 0.3 : il n'avait aucune donnée à lire sur un runner de CI, et les tests qu'il exécutait importaient le code qu'il venait de modifier, si bien qu'un patch aurait pu les truquer. C'est exactement le mode d'échec que Reason doit empêcher. `scripts/check_diff.py` reste disponible comme contrôle de CI autonome : il signale, dans toute pull request, les fichiers de tests touchés, les marqueurs `skip`/`xfail` ajoutés et les assertions supprimées.
+Reason ne livre aucun agent qui modifie son propre code ou ses tests : un modèle qui peut éditer ce qui le note finit par truquer la note. `scripts/check_diff.py` est un contrôle de CI autonome qui signale, dans toute pull request, les fichiers de tests touchés, les marqueurs `skip`/`xfail` ajoutés et les assertions supprimées.
 ## Prouver que ça marche
 
-Trois relectures indépendantes ont convergé sur le même point : une décision en JSON valide n'est pas une décision correcte, et la confiance qu'un modèle s'attribue n'est pas calibrée. La 0.3 ajoute de quoi mesurer, pas seulement affirmer.
+Une décision en JSON valide n'est pas une décision correcte, et la confiance qu'un modèle s'attribue n'est pas calibrée. Reason mesure au lieu d'affirmer.
 
 **Confiance des décisions calibrée.** Chaque issue d'une décision prise par un modèle est enregistrée sous la forme (confiance, juste ou non) dans `decision_scores.jsonl`. Ensuite :
 
@@ -366,8 +368,8 @@ Ordres de grandeur à garder en tête : distinguer un taux de réussite de 55 % 
 - Les leçons ne sont jamais écrites directement par un modèle : les propositions arrivent dans une file d'attente et sont approuvées par un humain. Chaque leçon est limitée à 300 caractères.
 - `state`, `event` et les entrées d'outils sont des données non fiables. Les prompts le disent, mais l'injection reste possible : gardez les actions irréversibles derrière une règle P0 ou `ask_human`.
 - Journal append-only par namespace (`DecisionMade`, `OutcomeRecorded`, `Executed`), rechargé au démarrage. Les entrées d'outils des hooks Claude Code sont tronquées à 4 000 caractères avant journalisation.
-- 0.3 : le serveur refuse de démarrer sans authentification (`serve --insecure` n'est permis que sur une adresse locale). En plus du `REASON_TOKEN` administrateur, `config.tokens` associe des secrets à des namespaces (motifs glob) et à des scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), vérifiés en HTTP, en MCP et dans les hooks. Un seul `reason serve` par `data_dir` (verrou de fichier). Les écritures du playbook et du journal sont verrouillées entre processus.
-- 0.3 : `redact_paths` (par exemple `state.facts.iban`, limité à `event`, `state`, `history`, `context`, `ruling_text`, `input`) masque les champs sensibles dans tout ce qui est persisté (journal, jeux de données, scores), alors que le modèle voit la requête complète ; le texte libre, comme la justification d'un modèle, n'est pas masqué ; `reason prune <ns> --days N` retire les vieux événements du journal, sauf les décisions encore en attente d'issue.
+- le serveur refuse de démarrer sans authentification (`serve --insecure` n'est permis que sur une adresse locale). En plus du `REASON_TOKEN` administrateur, `config.tokens` associe des secrets à des namespaces (motifs glob) et à des scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), vérifiés en HTTP, en MCP et dans les hooks. Un seul `reason serve` par `data_dir` (verrou de fichier). Les écritures du playbook et du journal sont verrouillées entre processus.
+- `redact_paths` (par exemple `state.facts.iban`, limité à `event`, `state`, `history`, `context`, `ruling_text`, `input`) masque les champs sensibles dans tout ce qui est persisté (journal, jeux de données, scores), alors que le modèle voit la requête complète ; le texte libre, comme la justification d'un modèle, n'est pas masqué ; `reason prune <ns> --days N` retire les vieux événements du journal, sauf les décisions encore en attente d'issue.
 
 ## Arborescence
 

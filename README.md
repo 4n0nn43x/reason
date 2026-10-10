@@ -11,6 +11,8 @@ Deterministic rules first, a cheap typed decider second, a reasoning model only 
 
 `Python ≥ 3.11` · `zero dependencies` · `MIT` · `HTTP · MCP · Claude Code hooks`
 
+Release notes and version history: [CHANGELOG.md](CHANGELOG.md).
+
 </div>
 
 ---
@@ -197,9 +199,9 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 
 `decide` short-circuits the models (0 ms, $0) when the action is a valid candidate. `forbid` vetoes the models' output: the action falls through to the next tier, then to the human. Operators: `eq ne gt gte lt lte in nin contains exists regex`. Prose policy read by the models lives in `policy.md`.
 
-## New in 0.2: from choices to scored estimates
+## Scored estimates, deferred outcomes, rules and lessons
 
-Reason 0.1 answered *which action*. 0.2 also answers *how likely*, and grades that answer when reality settles. Everything below is optional and backward compatible.
+Beyond *which action*, Reason can answer *how likely*, and grade that answer when reality settles. Everything in this section is optional.
 
 ```mermaid
 flowchart LR
@@ -211,7 +213,7 @@ flowchart LR
     R --> A
     S[(Settlement source<br/>JSONL · HTTP · subgraph)] -- reason poll --> O[POST /outcome v2<br/>or /estimate/outcome]
     O --> B[Brier · log-loss · RPS<br/>per namespace, source, lesson]
-    B -- reason calibrate --fit --> C
+    B -->|"reason calibrate"| C
     B --> L[(Lesson counters)]
 ```
 
@@ -332,10 +334,10 @@ Schedule both daily (cron, n8n Schedule, GitHub Actions). Track `pass^k`, not th
 
 ## No self-modifying agent
 
-Earlier versions shipped a weekly maintenance workflow that proposed patches to Reason itself. It was removed in 0.3: it had no data to read on a CI runner, and the tests it ran still imported the code it had just modified, so a patch could have rigged them. That is exactly the failure mode Reason exists to prevent. `scripts/check_diff.py` remains as a standalone CI check that flags touched test files, added `skip`/`xfail` markers and removed assertions in any pull request.
+Reason ships no agent that modifies its own code or tests: a model that can edit what grades it will game the grade. `scripts/check_diff.py` is a standalone CI check that flags touched test files, added `skip`/`xfail` markers and removed assertions in any pull request.
 ## Proving it works
 
-Three independent reviews converged on the same point: a valid JSON decision is not a correct one, and a model's self-reported confidence is not calibrated. 0.3 adds the tooling to measure, not just assert.
+A valid JSON decision is not a correct one, and a model's self-reported confidence is not calibrated. Reason measures instead of asserting.
 
 **Calibrated decision confidence.** Every outcome on a model-made decision is recorded as (confidence, correct) in `decision_scores.jsonl`. Then:
 
@@ -366,8 +368,8 @@ Orders of magnitude to keep in mind: telling a 55 % hit rate from 50 % takes rou
 - Lessons are never written by a model directly: proposals land in a pending queue and are approved by a human. Each lesson is capped at 300 characters.
 - `state`, `event`, tool inputs are untrusted data. The prompts say so, but prompt injection remains possible: keep irreversible actions behind a P0 rule or `ask_human`.
 - Append-only journal per namespace (`DecisionMade`, `OutcomeRecorded`, `Executed`), reloaded at startup. Tool inputs from Claude Code hooks are truncated to 4 000 characters before logging.
-- 0.3: the server refuses to start without authentication (`serve --insecure` is allowed on a loopback address only). Besides the admin `REASON_TOKEN`, `config.tokens` maps secrets to namespaces (glob patterns) and scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), checked on HTTP, MCP and hooks. One `reason serve` per `data_dir` (file lock). Playbook writes and journal appends are file-locked across processes.
-- 0.3: `redact_paths` (for example `state.facts.iban`, limited to `event`, `state`, `history`, `context`, `ruling_text`, `input`) masks sensitive fields in everything persisted (journal, datasets, scores) while the model still sees the full request; free text such as a model rationale is not masked; `reason prune <ns> --days N` removes old journal events except decisions still awaiting an outcome.
+- the server refuses to start without authentication (`serve --insecure` is allowed on a loopback address only). Besides the admin `REASON_TOKEN`, `config.tokens` maps secrets to namespaces (glob patterns) and scopes (`decide`, `outcome`, `execute`, `estimate`, `read`), checked on HTTP, MCP and hooks. One `reason serve` per `data_dir` (file lock). Playbook writes and journal appends are file-locked across processes.
+- `redact_paths` (for example `state.facts.iban`, limited to `event`, `state`, `history`, `context`, `ruling_text`, `input`) masks sensitive fields in everything persisted (journal, datasets, scores) while the model still sees the full request; free text such as a model rationale is not masked; `reason prune <ns> --days N` removes old journal events except decisions still awaiting an outcome.
 
 ## Project layout
 
@@ -386,7 +388,7 @@ reason/
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
   __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
 scripts/check_diff.py        test-tampering detector for PR diffs
-examples/                    config (v0.1 and v0.2), request, rules v2 and their test cases, n8n workflow, Claude Code settings
+examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests
 ```
 
