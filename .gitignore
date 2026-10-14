@@ -2,5 +2,5 @@ data/
 __pycache__/
 *.pyc
 .venv/
-reason.config.json
+/reason.config.json
 PATCH_NOTE.md

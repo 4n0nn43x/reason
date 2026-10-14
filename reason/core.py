@@ -42,6 +42,10 @@ BASE_RESULT = {"success": "success", "failure": "failure", "unknown": "unknown",
 DECISION_POINT = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 
 
+class InProgress(LLMError):
+    """Une décision avec la même clé d'idempotence est encore en cours (HTTP 409, draft-ietf-httpapi-idempotency-key-header)."""
+
+
 def base_result(o: dict) -> str:
     """Ramène une issue v2 à success | failure | unknown pour les compteurs et les bilans (fonction partagée)."""
     r = o.get("result")
@@ -162,6 +166,7 @@ class Engine:
         self._estimate_done: set[str] = set()
         self._seen_refs: dict[str, set] = {}                                # decision_id -> source_ref déjà appliqués
         self._journal_offsets: dict[str, int] = {}
+        self._journaled: set[str] = set()                                   # ids écrits ou relus dans un journal (purgeables)
         self.refresh()
 
     # --- rôles de modèles
@@ -259,6 +264,8 @@ class Engine:
         if not path.exists():
             return {"namespace": ns, "kept": 0, "removed": 0}
         with self._ns_lock(ns):
+            with self._lock:
+                journaled = set(self._journaled)
             lines = path.read_text().splitlines()
             kept, removed = [], 0
             for line in lines:
@@ -278,9 +285,39 @@ class Engine:
             tmp = path.with_suffix(".tmp")
             tmp.write_text("\n".join(kept) + ("\n" if kept else ""))
             os.replace(tmp, path)
-            st = path.stat()
-            self._journal_offsets[str(path)] = (st.st_ino, st.st_size)   # rien de nouveau à relire pour nous
+            self._evict_ns(ns, [json.loads(l) for l in kept], journaled)     # la mémoire suit le journal purgé
+            self._journal_offsets[str(path)] = (path.stat().st_ino, 0)   # relu depuis le début (idempotent)
+        self.refresh()
         return {"namespace": ns, "kept": len(kept), "removed": removed, "older_than_days": days}
+
+    def _evict_ns(self, ns: str, events: list[dict], journaled: set[str]) -> None:
+        """Après une purge (ici ou dans un autre processus) : oublie les décisions et estimations du namespace déjà relues
+        depuis le journal et absentes du nouveau journal `events`. Une décision indexée mais pas encore journalisée
+        (fenêtre entre _index et _journal) n'a jamais été relue : elle est gardée, comme les réservations d'idempotence.
+        `journaled` est figé AVANT la lecture du fichier : un id ajouté ensuite vient d'une ligne que la lecture n'a pas vue."""
+        def ids(kind, field, key):
+            return {e[field].get(key) for e in events if e.get("type") == kind and isinstance(e.get(field), dict)}
+        keep_d, keep_e = ids("DecisionMade", "decision", "decision_id"), ids("EstimateMade", "estimate", "estimate_id")
+        with self._lock:
+            gone = {did for did, rec in self._by_id.items()
+                    if rec["request"].get("namespace") == ns and did in journaled and did not in keep_d}
+            for did in gone:
+                req = self._by_id.pop(did)["request"]
+                self._journaled.discard(did)
+                self._outcomes.pop(did, None)
+                self._seen_refs.pop(did, None)
+                k = (req.get("run_id"), req.get("decision_point"))
+                if req.get("run_id") and k in self._runs:
+                    self._runs[k] -= 1
+                    if self._runs[k] <= 0:
+                        del self._runs[k]
+            for key in [k for k, v in self._by_key.items() if isinstance(v, dict) and v.get("decision_id") in gone]:
+                del self._by_key[key]
+            for eid in [e for e, rec in self._estimates.items() if rec["estimate"].get("namespace") == ns
+                        and e in journaled and e not in keep_e]:
+                del self._estimates[eid]
+                self._journaled.discard(eid)
+                self._estimate_done.discard(eid)
 
     def refresh(self) -> None:
         """Relit les journaux depuis le dernier offset connu. Idempotent : nos propres écritures relues sont ignorées.
@@ -293,28 +330,43 @@ class Engine:
                 st = jp.stat()
             except OSError:
                 continue
-            ino, off = self._journal_offsets.get(key, (st.st_ino, 0))
+            ino, off = self._journal_offsets.get(key, (None, 0))
             size = st.st_size
-            if ino != st.st_ino or size < off:   # fichier remplacé (prune) ou tronqué : on repart du début (idempotent)
+            # première lecture, fichier remplacé (prune) ou tronqué : relu en entier, l'éviction compare au contenu complet
+            replaced = ino != st.st_ino or size < off
+            if replaced:
                 off = 0
-            if size == off:
+            if size == off and not replaced:
                 continue
+            with self._lock:
+                journaled = set(self._journaled) if replaced else None
             with open(jp, "rb") as f:
                 f.seek(off)
                 data = f.read()
             cut = data.rfind(b"\n") + 1        # ne consommer que des lignes complètes
             self._journal_offsets[key] = (st.st_ino, off + cut)
+            events = []
             for line in data[:cut].splitlines():
                 try:
-                    self._apply_event(json.loads(line))
-                except (ValueError, KeyError, TypeError):
+                    ev = json.loads(line)
+                except ValueError:
                     continue   # ligne partielle (crash en cours d'écriture) : ignorée
+                if isinstance(ev, dict):
+                    events.append(ev)
+            if replaced:                       # ce que la purge a retiré quitte aussi la mémoire
+                self._evict_ns(jp.parent.relative_to(self.data_dir).as_posix(), events, journaled)
+            for ev in events:
+                try:
+                    self._apply_event(ev)
+                except (KeyError, TypeError):
+                    continue
 
     def _apply_event(self, ev: dict) -> None:
         t = ev.get("type")
         with self._lock:
             if t == "DecisionMade":
                 self._index(ev["request"], ev["decision"], ev.get("ts"))
+                self._journaled.add(ev["decision"]["decision_id"])
             elif t in ("OutcomeRecorded", "OutcomeRevised"):
                 o = ev["outcome"]
                 did = ev["decision_id"]
@@ -327,6 +379,7 @@ class Engine:
                     self._seen_refs.setdefault(did, set()).add(o["source_ref"])
             elif t == "EstimateMade":
                 self._estimates.setdefault(ev["estimate"]["estimate_id"], {"request": ev["request"], "estimate": ev["estimate"]})
+                self._journaled.add(ev["estimate"]["estimate_id"])
             elif t == "EstimateResolved":
                 self._estimate_done.add(ev["estimate_id"])
 
@@ -395,6 +448,8 @@ class Engine:
                 done = self._by_key.get(key)
                 if isinstance(done, dict):
                     return {**done, "replayed": True}
+                if self._by_key.get(key) is held:   # la première requête tourne encore : 409, réessayer avec la même clé
+                    raise InProgress("décision en cours pour cette clé d'idempotence : réessayer avec la même clé")
                 raise LLMError("décision concurrente non aboutie pour cette clé d'idempotence")
         try:
             return self._decide(req)
@@ -575,6 +630,8 @@ class Engine:
         if dec["lessons_used"]:
             self.playbook(ns).touch(dec["lessons_used"])
         self._journal(ns, {"type": "DecisionMade", "request": req, "decision": dec})
+        with self._lock:
+            self._journaled.add(dec["decision_id"])   # écrite : purgeable même si ce processus ne relit jamais le journal
         return dec
 
     # --- retour d'expérience (issue v2, versionnée)
@@ -731,20 +788,25 @@ class Engine:
         n = min(10, max(1, int(x.get("n_samples") or (self.config.get("estimate") or {}).get("n_samples") or 1)))
         # plusieurs échantillons demandent de la variété ; un modèle de raisonnement configuré avec temperature: null la garde
         temp = 0.7 if (n > 1 and getattr(llm, "temperature", None) is not None) else None
-        samples = []
-        for _ in range(n):
-            out, _ = llm.chat([{"role": "system", "content": system}, {"role": "user", "content": user}], schema=schema,
-                              temperature=temp)
-            e = validate(out, schema)
-            if e:
-                raise LLMError(f"sortie de l'estimateur invalide: {e}")
-            samples.append(out)
+        samples, last = [], None
+        for _ in range(n):           # un échantillon en échec est écarté (comme dans decide) ; n_samples = échantillons retenus
+            try:
+                out, _ = llm.chat([{"role": "system", "content": system}, {"role": "user", "content": user}], schema=schema,
+                                  temperature=temp)
+                e = validate(out, schema)
+                if e:
+                    raise LLMError(f"sortie de l'estimateur invalide: {e}")
+                samples.append(out)
+            except LLMError as err:
+                last = err
+        if not samples:
+            raise last or LLMError("aucun échantillon")
         est = self._aggregate(kind, outcomes, samples)
         est.update({"estimate_id": _eid(), "namespace": ns, "kind": kind, "outcomes": outcomes, "now": x["now"],
                     "source": samples[0]["source"], "base_rate": samples[0].get("base_rate"),
                     "evidence": samples[0].get("evidence", []), "rationale": samples[0].get("rationale", ""),
                     "lessons_used": [l for l in samples[0].get("lessons_used", []) if l in shown], "lessons_shown": shown,
-                    "n_samples": len(samples), "model": getattr(llm, "model", None), "market_price": x.get("market_price"),
+                    "n_samples": len(samples), "n_requested": n, "model": getattr(llm, "model", None), "market_price": x.get("market_price"),
                     "resolves_at": x.get("resolves_at"), "status": "ok"})
         est["calibrated"] = self._calibrate(ns, est)
         if dry_run:
@@ -754,6 +816,8 @@ class Engine:
         with self._lock:
             self._estimates[est["estimate_id"]] = {"request": x, "estimate": est}
         self._journal(ns, {"type": "EstimateMade", "request": x, "estimate": est})
+        with self._lock:
+            self._journaled.add(est["estimate_id"])
         return est
 
     @staticmethod
@@ -811,6 +875,7 @@ class Engine:
         errs = validate(o, ESTIMATE_OUTCOME_SCHEMA)
         if errs:
             raise ValueError("estimate_outcome invalide: " + "; ".join(errs))
+        self.refresh()          # estimation faite par un autre processus (CLI) après le démarrage du serveur
         rec = self._estimates.get(o["estimate_id"])
         if not rec:
             raise KeyError(f"estimation inconnue: {o['estimate_id']}")

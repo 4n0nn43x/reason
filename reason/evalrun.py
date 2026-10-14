@@ -233,7 +233,8 @@ def fit_calibration(engine: Engine, ns: str, min_n: int = 30) -> dict:
             current[src] = {**fit, "fitted_at": time.time()}
         elif src in current:
             current.pop(src)        # un ajustement qui n'améliore plus le test est retiré
-    (engine.ns_dir(ns) / "calibration.json").write_text(json.dumps(current, indent=1))
+    path = engine.ns_dir(ns) / "calibration.json"   # écriture atomique : `estimate` le lit pendant qu'on écrit
+    tmp = path.with_suffix(".tmp"); tmp.write_text(json.dumps(current, indent=1)); os.replace(tmp, path)
     return {"namespace": ns, "fits": report, "active": current}
 
 

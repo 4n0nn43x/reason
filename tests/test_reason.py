@@ -316,6 +316,12 @@ class TestServer(unittest.TestCase):
         self.assertEqual(self.call("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual([t["name"] for t in r["result"]["tools"]], ["decide", "outcome", "execute", "estimate", "estimate_outcome"])
+        hints = {t["name"]: (t["annotations"]["readOnlyHint"], t["annotations"]["destructiveHint"],
+                             t["annotations"]["idempotentHint"], t["annotations"]["openWorldHint"]) for t in r["result"]["tools"]}
+        self.assertEqual(hints, {"decide": (False, False, False, True), "outcome": (False, True, True, True),
+                                 "execute": (False, False, False, True), "estimate": (False, False, False, True),
+                                 "estimate_outcome": (False, True, True, False)})
+        self.assertTrue(all(t["title"] == t["annotations"]["title"] for t in r["result"]["tools"]))
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                             "params": {"name": "decide", "arguments": req(run_id="mcp-1")}})
         self.assertFalse(r["result"]["isError"]); self.assertEqual(r["result"]["structuredContent"]["action"]["name"], "approve")
@@ -1068,6 +1074,111 @@ class TestCheckDiff(unittest.TestCase):
         clean = "diff --git a/src/ok.py b/src/ok.py\n--- a/src/ok.py\n+++ b/src/ok.py\n@@ -1 +1 @@\n-a=1\n+a=2\n"
         p = subprocess.run([sys.executable, str(script)], input=clean, capture_output=True, text=True)
         self.assertEqual(p.returncode, 0)
+
+
+class TestAnalysisFixes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_invalid_content_length_is_400(self):
+        server.Handler.engine = engine(str(self.tmp), decider=FakeLLM("d", []))
+        server.Handler.token = "admin"
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            for cl in ("-1", "+5", "1_0", "²"):
+                c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+                c.putrequest("POST", "/decide"); c.putheader("Authorization", "Bearer admin")
+                c.putheader("Content-Length", cl); c.endheaders(); c.send(b"{}")
+                r = c.getresponse(); r.read(); c.close()
+                self.assertEqual(r.status, 400, cl)
+        finally:
+            srv.shutdown(); srv.server_close(); server.Handler.token = None
+
+    def test_estimate_outcome_sees_estimate_from_other_process(self):
+        srv_eng = engine(str(self.tmp), decider=FakeLLM("d", []))              # « serveur » démarré avant
+        e = engine(str(self.tmp), decider=FakeLLM("m", [est(0.7)])).estimate({"namespace": "mkt", "question": "?", "kind": "binary"})
+        self.assertTrue(srv_eng.estimate_outcome({"estimate_id": e["estimate_id"], "outcome": 1})["recorded"])
+
+    def test_estimate_tolerates_a_failed_sample(self):
+        eng = engine(str(self.tmp), decider=FakeLLM("m", [LLMError("panne"), est(0.6), est(0.8), LLMError("a"), LLMError("b")]))
+        e = eng.estimate({"namespace": "mkt", "question": "?", "kind": "binary", "n_samples": 3})
+        self.assertEqual((e["n_samples"], e["n_requested"]), (2, 3))
+        with self.assertRaises(LLMError):
+            eng.estimate({"namespace": "mkt", "question": "?", "kind": "binary", "n_samples": 2})
+
+    def test_concurrent_idempotency_still_running_is_in_progress(self):
+        class Instant(threading.Event):
+            def wait(self, timeout=None):
+                return False                                                    # délai d'attente écoulé
+        eng = engine(str(self.tmp), decider=FakeLLM("d", []))
+        eng._by_key[("acme/invoices", "k")] = Instant()                         # première requête toujours en vol
+        with self.assertRaises(core.InProgress):
+            eng.decide(req(idempotency_key="k"))
+
+    def test_prune_shrinks_memory_here_and_in_other_process(self):
+        a = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve") for _ in range(10)]))
+        b = engine(str(self.tmp), decider=FakeLLM("d", []))
+        old = [a.decide(req(run_id=f"x{i}")) for i in range(3)]
+        for d in old[:2]:
+            a.outcome({"decision_id": d["decision_id"], "result": "success"})
+        b.refresh()
+        self.assertEqual(len(b._by_id), 3)
+        j = self.tmp / "acme/invoices/journal.jsonl"
+        lines = [json.loads(l) for l in j.read_text().splitlines()]
+        for ev in lines:
+            ev["ts"] = 0
+        j.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+        a.prune("acme/invoices", days=1)
+        keep = old[2]["decision_id"]
+        self.assertEqual((list(a._by_id), list(a._outcomes)), ([keep], []))
+        b.refresh()
+        self.assertEqual((list(b._by_id), list(b._outcomes)), ([keep], []))
+        self.assertEqual([p["decision_id"] for p in b.pending("acme/invoices")], [keep])
+        self.assertEqual(a._runs, {("x2", "before_pay"): 1})
+
+    def test_prune_between_index_and_journal_keeps_in_flight_decision(self):
+        a = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve") for _ in range(5)]))
+        a.decide(req(run_id="r0"))
+        orig = a._journal
+        def late(ns, ev):                                                      # purge pendant la fenêtre _index → _journal
+            if ev["type"] == "DecisionMade":
+                a.prune(ns, days=1)
+            orig(ns, ev)
+        a._journal = late
+        r1 = a.decide(req(idempotency_key="K"))
+        a._journal = orig
+        r2 = a.decide(req(idempotency_key="K"))
+        self.assertEqual((r2.get("replayed"), r2["decision_id"]), (True, r1["decision_id"]))
+
+    def test_prune_by_other_process_evicts_decision_never_read_back(self):
+        srv = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve")]))  # serveur : /decide seulement
+        pol = engine(str(self.tmp), decider=FakeLLM("d", []))                  # poller et CLI : autre processus
+        did = srv.decide(req(run_id="r", idempotency_key="K"))["decision_id"]
+        pol.refresh(); pol.outcome({"decision_id": did, "result": "success"})
+        j = self.tmp / "acme/invoices/journal.jsonl"
+        evs = [json.loads(l) for l in j.read_text().splitlines()]
+        for e in evs:
+            e["ts"] = 0
+        j.write_text("".join(json.dumps(e) + "\n" for e in evs))
+        pol.prune("acme/invoices", days=1)
+        self.assertEqual(srv.pending("acme/invoices"), [])
+        self.assertEqual((did in srv._by_id, srv._runs, ("acme/invoices", "K") in srv._by_key), (False, {}, False))
+
+    def test_decision_written_during_a_full_reread_is_not_evicted(self):
+        other = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve")]))
+        a = engine(str(self.tmp), decider=FakeLLM("d", [typed("approve")]))
+        other.decide(req(run_id="o"))                                          # journal créé après le démarrage de a
+        orig = a._evict_ns
+        box = {}
+        def during(*args):                                                     # autre thread : decide après la lecture
+            box["d"] = orig.__self__.decide(req(run_id="t2", idempotency_key="k1")) if not box else box["d"]
+            return orig(*args)
+        a._evict_ns = during
+        a.refresh()                                                            # première lecture complète du journal
+        a._evict_ns = orig
+        self.assertIn(box["d"]["decision_id"], a._by_id)
+        self.assertEqual(a.decide(req(run_id="t2", idempotency_key="k1"))["decision_id"], box["d"]["decision_id"])
 
 
 if __name__ == "__main__":

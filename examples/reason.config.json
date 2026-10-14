@@ -1,0 +1,23 @@
+{
+  "data_dir": "data",
+  "models": {
+    "typed": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
+              "model": "gpt-6-luna", "json_schema": true, "max_tokens": 512},
+    "reasoner": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
+                 "model": "gpt-6.1-sol", "json_schema": true, "reasoning_effort": "high", "max_tokens": 16000,
+                 "max_tokens_key": "max_completion_tokens", "temperature": null},
+    "deepseek": {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY",
+                 "model": "deepseek-flash", "json_schema": false, "reasoning_effort": "none", "max_tokens": 2048},
+    "haiku_via_openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY",
+                             "model": "anthropic/claude-haiku-5.5", "json_schema": true},
+    "jev": {"provider": "jev", "base_url": "https://api.typesafe.ai", "api_key_env": "TYPESAFE_API_KEY", "model": "jev-latest"},
+    "jev_via_openrouter": {"provider": "jev", "base_url": "https://openrouter.ai/api", "api_key_env": "OPENROUTER_API_KEY", "model": "jev-latest"}
+  },
+  "roles": {
+    "decider": "typed",
+    "reasoner": "reasoner",
+    "executor": "deepseek",
+    "reflector": "typed"
+  },
+  "thresholds": {"decider_confidence": 0.75, "reasoner_confidence": 0.6, "loop_max_repeats": 3, "lessons_max_chars": 4000}
+}

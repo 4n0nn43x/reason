@@ -19,22 +19,39 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import __version__
-from .core import ESTIMATE_OUTCOME_SCHEMA, ESTIMATE_SCHEMA, EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine
+from .core import ESTIMATE_OUTCOME_SCHEMA, ESTIMATE_SCHEMA, EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine, InProgress
 from .llm import LLMError
 
 MAX_BODY = 1_000_000
 MAX_TOOL_INPUT_CHARS = 4000
+
+
+def _tool(name: str, title: str, description: str, schema: dict, destructive: bool, idempotent: bool, open_world: bool) -> dict:
+    """Outil MCP avec ses annotations (spec 2025-11-25, ToolAnnotations). Aucun outil n'est en lecture seule : tous
+    journalisent. destructive = met à jour un état existant (compteurs de leçons, qui peuvent archiver une leçon) au lieu
+    d'ajouter seulement ; idempotent = même appel, aucun effet de plus ; open_world = appelle un fournisseur de modèle.
+    `title` est doublé dans annotations pour les clients antérieurs à la spec 2025-06-18. Indices non fiables par nature :
+    les garde-fous restent côté serveur (jetons, scopes, règles)."""
+    return {"name": name, "title": title, "description": description, "inputSchema": schema,
+            "annotations": {"title": title, "readOnlyHint": False, "destructiveHint": destructive,
+                            "idempotentHint": idempotent, "openWorldHint": open_world}}
+
+
 MCP_TOOLS = [
-    {"name": "decide", "description": "Prend une décision bornée pour une automatisation (règles → modèle → humain). "
-                                      "Retourne action, confiance, besoin d'humain.", "inputSchema": REQUEST_SCHEMA},
-    {"name": "outcome", "description": "Rapporte le résultat réel d'une décision (success|failure|unknown) pour l'apprentissage.",
-     "inputSchema": OUTCOME_SCHEMA},
-    {"name": "execute", "description": "Exécute une tâche de texte/extraction avec le modèle exécuteur et les leçons du namespace.",
-     "inputSchema": EXECUTE_SCHEMA},
-    {"name": "estimate", "description": "Estimation probabiliste calibrée (binaire, catégorielle, ordinale, quantité) avec source et preuves.",
-     "inputSchema": ESTIMATE_SCHEMA},
-    {"name": "estimate_outcome", "description": "Résout une estimation (issue réelle) pour la scorer (Brier, log-loss) et créditer les leçons.",
-     "inputSchema": ESTIMATE_OUTCOME_SCHEMA},
+    # decide : sans idempotency_key, un second appel identique produit une nouvelle décision
+    _tool("decide", "Décider", "Prend une décision bornée pour une automatisation (règles → modèle → humain). "
+                               "Retourne action, confiance, besoin d'humain.", REQUEST_SCHEMA,
+          destructive=False, idempotent=False, open_world=True),
+    # outcome : met à jour les compteurs de leçons ; un renvoi identique est reconnu (source_ref) et sans effet
+    _tool("outcome", "Rapporter une issue", "Rapporte le résultat réel d'une décision (success|failure|unknown) pour l'apprentissage.",
+          OUTCOME_SCHEMA, destructive=True, idempotent=True, open_world=True),
+    _tool("execute", "Exécuter une tâche", "Exécute une tâche de texte/extraction avec le modèle exécuteur et les leçons du namespace.",
+          EXECUTE_SCHEMA, destructive=False, idempotent=False, open_world=True),
+    _tool("estimate", "Estimer une probabilité", "Estimation probabiliste calibrée (binaire, catégorielle, ordinale, quantité) avec source et preuves.",
+          ESTIMATE_SCHEMA, destructive=False, idempotent=False, open_world=True),
+    # estimate_outcome : aucun appel modèle ; une seconde résolution est un doublon sans effet
+    _tool("estimate_outcome", "Résoudre une estimation", "Résout une estimation (issue réelle) pour la scorer (Brier, log-loss) et créditer les leçons.",
+          ESTIMATE_OUTCOME_SCHEMA, destructive=True, idempotent=True, open_world=False),
 ]
 SCOPE = {"decide": "decide", "outcome": "outcome", "execute": "execute", "estimate": "estimate", "estimate_outcome": "estimate"}
 
@@ -74,7 +91,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
+        # RFC 9110 §8.6 / RFC 9112 §6.3 : Content-Length = 1*DIGIT, une seule valeur ; sinon 400 et connexion fermée.
+        # int() accepterait « -1 » (rfile.read(-1) lit jusqu'à EOF, sans limite), « +5 » ou « 1_0 ».
+        vals = self.headers.get_all("Content-Length") or []
+        v = vals[0].strip() if len(vals) == 1 else ("" if vals else "0")
+        if not (v.isascii() and v.isdigit()) or self.headers.get("Transfer-Encoding"):   # chunked non géré
+            self.close_connection = True
+            raise ValueError("Content-Length invalide")
+        n = int(v)
         if n > MAX_BODY:
             raise ValueError("corps trop volumineux")
         raw = self.rfile.read(n) if n else b"{}"
@@ -119,6 +143,7 @@ class Handler(BaseHTTPRequestHandler):
             rec = self.engine._by_id.get(body.get("decision_id"))
             return rec["request"]["namespace"] if rec else None
         if kind == "estimate_outcome":
+            self.engine.refresh()
             rec = self.engine._estimates.get(body.get("estimate_id"))
             return rec["estimate"]["namespace"] if rec else None
         return None
@@ -184,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": str(e)})
         except (ValueError, KeyError) as e:
             return self._json(400, {"error": str(e)})
+        except InProgress as e:
+            return self._json(409, {"error": str(e)})
         except LLMError as e:
             return self._json(502, {"error": f"modèle: {e}"})
         except Exception:  # noqa: BLE001  jamais de 500 silencieux
