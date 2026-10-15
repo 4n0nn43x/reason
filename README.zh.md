@@ -323,6 +323,8 @@ flowchart TB
 | Claude Code 钩子 | `PreToolUse` 让 Reason 在每次工具调用前允许、拒绝或询问 | `examples/claude-settings.json` |
 | MCP | 宿主智能体自行选择调用的工具：是建议，不是关卡 | n8n MCP Client Tool、Claude Agent SDK、OpenAI Agents SDK |
 
+**钩子中的人工答复。** 当 Reason 将工具调用升级（`ask_human`）时，原因末尾带有 `[decision <id>]`。拥有 `approve` 作用域的令牌通过 `POST /hooks/claude/answer {"decision_id": "<id>", "action": "allow" | "deny", "updated_input": {...}, "note": "..."}` 答复（`outcome` 不够：批准或改写命令是单独的权限）。答复适用于同一决策，以及同一会话中的同一调用（完整工具输入的 SHA-256）；最新的答复生效，`deny` 优先于任何决策，`allow` 只裁决升级，绝不推翻由规则或模型决定的 `deny`。答复绑定到会话以及工具名称和完整输入的 SHA-256，并用保存在 `data_dir/hook.key` 中的密钥签名，因此通过 `/decide` 伪造的决策无法被批准。请给钩子本身一个仅限 `decide` 的令牌：若使用管理员令牌，代理可以答复自己的升级。若为 `allow`，`updated_input` 成为钩子的 `updatedInput`，它会替换整个工具输入。答复不是结果：之后照常用 `/outcome` 记录真实结果。设置 `REASON_HOOK_DEFER=1` 后，未答复的升级返回 `defer`：`claude -p` 运行以 `stop_reason: "tool_deferred"` 停止，执行 `claude -p --resume <session>` 后答复生效；交互式会话忽略 `defer`，回到常规的权限提示。同一调用仍在决策中时返回 HTTP 200 的 `ask`，因为非 2xx 状态不会阻止工具调用。
+
 ## 评测闭环
 
 ```bash
@@ -386,7 +388,7 @@ python -m reason bench --namespace acme/invoices
 - 经验绝不由模型直接写入：提案进入待审队列，由人工批准。每条经验上限 300 字符。
 - `state`、`event`、工具输入都是不可信数据。提示词会声明这一点，但提示注入仍然可能：把不可逆动作放在 P0 规则或 `ask_human` 之后。
 - 每个命名空间有只追加的日志（`DecisionMade`、`OutcomeRecorded`、`Executed`），启动时重新加载。来自 Claude Code 钩子的工具输入在记录前截断到 4 000 字符。
-- 没有认证时服务器拒绝启动（`serve --insecure` 仅允许在本地回环地址上使用）。除管理员 `REASON_TOKEN` 外，`config.tokens` 把密钥映射到命名空间（glob 模式）和作用域（`decide`、`outcome`、`execute`、`estimate`、`read`），在 HTTP、MCP 与钩子中都会校验。每个 `data_dir` 只允许一个 `reason serve`（文件锁）。经验手册与日志的写入在进程之间加锁。
+- 没有认证时服务器拒绝启动（`serve --insecure` 仅允许在本地回环地址上使用）。除管理员 `REASON_TOKEN` 外，`config.tokens` 把密钥映射到命名空间（glob 模式）和作用域（`decide`、`outcome`、`execute`、`estimate`、`read`、`approve`），在 HTTP、MCP 与钩子中都会校验。每个 `data_dir` 只允许一个 `reason serve`（文件锁）。经验手册与日志的写入在进程之间加锁。
 - `redact_paths`（例如 `state.facts.iban`，仅限 `event`、`state`、`history`、`context`、`ruling_text`、`input`）会在所有持久化内容（日志、数据集、评分）中屏蔽敏感字段，而模型仍能看到完整请求；模型理由等自由文本不会被屏蔽；`reason prune <ns> --days N` 删除旧日志事件，仍在等待结果的决策除外。
 
 ## 项目结构

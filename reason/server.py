@@ -2,6 +2,7 @@
   POST /decide  POST /outcome  POST /execute  GET /lessons/<ns>  GET /health      (JSON, gate universel)
   POST /mcp     JSON-RPC MCP (initialize, tools/list, tools/call), stateless        (n8n MCP Client, Claude, Cursor...)
   POST /hooks/claude   hook http de Claude Code : PreToolUse → decide, SessionStart/UserPromptSubmit → leçons
+  POST /hooks/claude/answer   réponse humaine à un appel d'outil escaladé (scope approve)
 Stdlib uniquement (ThreadingHTTPServer).
 """
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -207,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._mcp(body)
             if self.path == "/hooks/claude":
                 return self._json(200, self._claude_hook(body))
+            if self.path == "/hooks/claude/answer":
+                return self._json(200, self._hook_answer(body))
             return self._json(404, {"error": "inconnu"})
         except Forbidden as e:
             return self._json(403, {"error": str(e)})
@@ -304,23 +308,102 @@ class Handler(BaseHTTPRequestHandler):
             tool_input = json.dumps(h.get("tool_input"), ensure_ascii=False)[:MAX_TOOL_INPUT_CHARS]
             # le point de décision inclut l'empreinte de l'entrée : l'anti-boucle ne vise que la répétition du même appel
             point = f"tool:{h.get('tool_name')}:{hashlib.sha1(tool_input.encode()).hexdigest()[:8]}"
-            dec = self.engine.decide({
-                "namespace": ns, "run_id": h.get("session_id"), "decision_point": point,
-                "event": {"type": "tool_call", "tool_name": h.get("tool_name"), "tool_input": tool_input},
-                "state": {"cwd": h.get("cwd"), "permission_mode": h.get("permission_mode")},
-                "candidate_actions": [{"name": "allow", "schema": {"type": "object", "additionalProperties": False}},
-                                      {"name": "deny", "schema": {"type": "object", "additionalProperties": False}}],
-                "idempotency_key": h.get("tool_use_id")})
+            full = hashlib.sha256(json.dumps({"tool_name": h.get("tool_name"), "tool_input": h.get("tool_input")},
+                                             ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            try:
+                dec = self.engine.decide({
+                    "namespace": ns, "run_id": h.get("session_id"), "decision_point": point,
+                    "event": {"type": "tool_call", "tool_name": h.get("tool_name"), "tool_input": tool_input,
+                              "tool_input_sha256": full, "hook_mac": self._hook_mac(ns, h.get("session_id"), full)},
+                    "state": {"cwd": h.get("cwd"), "permission_mode": h.get("permission_mode")},
+                    "candidate_actions": [{"name": "allow", "schema": {"type": "object", "additionalProperties": False}},
+                                          {"name": "deny", "schema": {"type": "object", "additionalProperties": False}}],
+                    "idempotency_key": h.get("tool_use_id")})
+            except InProgress:              # un statut non 2xx ne bloquerait pas l'outil : répondre ask en 200
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                               "permissionDecisionReason": "Reason: décision déjà en cours pour cet appel"}}
             name = dec["action"]["name"]
             decision = {"allow": "allow", "deny": "deny"}.get(name, "ask")
-            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
-                                           "permissionDecisionReason": f"Reason[{dec['tier']}] {dec['rationale']}"[:500]}}
+            out = {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                   "permissionDecisionReason": f"Reason[{dec['tier']}] {dec['rationale']}"[:500]}
+            # réponse humaine (POST /hooks/claude/answer) sur cette décision, ou sur le même appel de la même session
+            # (empreinte sha256 de l'entrée complète) : la plus récente gagne ; deny l'emporte sur tout, allow ne
+            # tranche qu'une escalade (jamais un refus de règle ou de modèle)
+            ans = next((r for r in reversed(self._answers(ns)) if r.get("decision_id") == dec["decision_id"]
+                        or (h.get("session_id") and r.get("session_id") == h.get("session_id")
+                            and r.get("tool_input_sha256") == full)), None)
+            if ans and (ans["action"] == "deny" or name == "ask_human"):
+                out["permissionDecision"] = ans["action"]
+                out["permissionDecisionReason"] = "Reason[human] " + (ans.get("note") or "réponse humaine")[:480]
+                if ans["action"] == "allow" and isinstance(ans.get("updated_input"), dict):
+                    out["updatedInput"] = ans["updated_input"]        # remplace l'entrée entière (spec des hooks)
+            elif name == "ask_human":
+                out["permissionDecisionReason"] = out["permissionDecisionReason"][:460] + f" [decision {dec['decision_id']}]"
+                if os.environ.get("REASON_HOOK_DEFER") == "1":
+                    out["permissionDecision"] = "defer"            # claude -p seulement ; ignoré en interactif
+            return {"hookSpecificOutput": out}
         if ev in ("SessionStart", "UserPromptSubmit"):
             text, _ = self.engine.playbook(ns).render(self.engine.thresholds["lessons_max_chars"])
             if not text:
                 return {}
             return {"hookSpecificOutput": {"hookEventName": ev, "additionalContext": "Leçons Reason pour ce projet :\n" + text}}
         return {}
+
+
+    def _answers(self, ns: str) -> list[dict]:
+        """Réponses valides seulement : une ligne illisible ne doit jamais faire tomber le gate (non 2xx = outil exécuté)."""
+        p = self.engine.ns_dir(ns) / "hook_answers.jsonl"      # ponytail: relu à chaque appel, indexer si le fichier grossit
+        try:
+            with self.engine._ns_lock(ns):
+                lines = p.read_text().splitlines() if p.exists() else []
+        except (OSError, UnicodeDecodeError):
+            return []
+        out = []
+        for l in lines:
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("action") in ("allow", "deny"):
+                out.append(r)
+        return out
+
+    def _hook_mac(self, ns: str, session: str | None, sha: str) -> str:
+        """Prouve qu'une décision vient du hook : /decide accepte n'importe quel event et ne connaît pas la clé."""
+        kp = self.engine.data_dir / "hook.key"
+        if not kp.exists():
+            try:
+                fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(os.urandom(32))
+            except FileExistsError:
+                pass
+        key = kp.read_bytes()
+        return hmac.new(key, f"{ns}\n{session}\n{sha}".encode(), hashlib.sha256).hexdigest()
+
+    def _hook_answer(self, b: dict) -> dict:
+        """Réponse humaine à un appel d'outil escaladé : scope approve (distinct d'outcome : approuver ou réécrire une
+        commande est un privilège). Ni issue, ni score, ni leçon : l'issue réelle s'enregistre ensuite via /outcome."""
+        self.engine.refresh()
+        did = b.get("decision_id")
+        rec = self.engine._by_id.get(did) if isinstance(did, str) else None
+        ns = rec["request"]["namespace"] if rec else None
+        self._check("approve", ns)
+        ev = rec["request"].get("event") or {} if rec else {}
+        sha = ev.get("tool_input_sha256")
+        if not (rec and isinstance(sha, str) and isinstance(ev.get("hook_mac"), str) and hmac.compare_digest(
+                ev["hook_mac"], self._hook_mac(ns, rec["request"].get("run_id"), sha))):
+            raise KeyError("décision de hook inconnue")
+        if b.get("action") not in ("allow", "deny"):
+            raise ValueError("action doit valoir allow ou deny")
+        if "updated_input" in b and (b["action"] != "allow" or not isinstance(b["updated_input"], dict)):
+            raise ValueError("updated_input : un objet, avec allow seulement")
+        row = {"decision_id": rec["decision"]["decision_id"], "session_id": rec["request"].get("run_id"),
+               "tool_input_sha256": sha, "action": b["action"],
+               "note": str(b.get("note") or "")[:480], "ts": time.time(),
+               **({"updated_input": b["updated_input"]} if "updated_input" in b else {})}
+        self.engine._append(ns, "hook_answers.jsonl", row)
+        return {"recorded": True, "decision_id": row["decision_id"], "action": row["action"]}
 
 
 def _header_value(v: str | None) -> str | None:

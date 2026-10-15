@@ -366,6 +366,70 @@ class TestServer(unittest.TestCase):
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 9, "method": "tools/list"})   # client 2025-11-25 inchangé
         self.assertEqual((st, len(r["result"]["tools"]), "_meta" in r["result"]), (200, 5, False))
 
+    def test_claude_hook_human_answer_defer_updated_input(self):
+        self.dec.answers[:0] = [typed("allow", conf=0.1, params={}) for _ in range(3)] + [typed("allow", params={})]
+        hook = {"hook_event_name": "PreToolUse", "session_id": "s-defer", "cwd": "/tmp/p", "tool_name": "Bash",
+                "tool_input": {"command": "x" * 4100 + " SAFE"}, "tool_use_id": "u1"}
+        hs = lambda body: self.call("POST", "/hooks/claude", body)[1]["hookSpecificOutput"]
+        self.assertEqual(hs(hook)["permissionDecision"], "ask")                # escalade, interactif par défaut
+        os.environ["REASON_HOOK_DEFER"] = "1"
+        try:
+            r = hs({**hook, "tool_use_id": "u2"})
+        finally:
+            del os.environ["REASON_HOOK_DEFER"]
+        self.assertEqual(r["permissionDecision"], "defer")
+        did = r["permissionDecisionReason"].rsplit("[decision ", 1)[1].rstrip("]")
+        new_input = {"command": "x" * 4100 + " SAFE", "description": "validé"}
+        server.Handler.tokens = {"poller": {"namespaces": ["claude/*"], "scopes": ["outcome"]},
+                                 "human": {"namespaces": ["claude/*"], "scopes": ["approve"]}}
+        try:
+            answer = {"decision_id": did, "action": "allow", "updated_input": new_input}
+            self.assertEqual(self.call("POST", "/hooks/claude/answer", answer, token="poller")[0], 403)  # outcome ne suffit pas
+            self.assertEqual(self.call("POST", "/hooks/claude/answer", {**answer, "action": "deny"}, token="human")[0], 400)
+            self.assertEqual(self.call("POST", "/hooks/claude/answer", answer, token="human")[0], 200)
+        finally:
+            server.Handler.tokens = {}
+        r = hs({**hook, "tool_use_id": "u2"})                                   # reprise de la session différée
+        self.assertEqual((r["permissionDecision"], r["updatedInput"]), ("allow", new_input))
+        self.assertEqual(hs({**hook, "tool_use_id": "u3"})["permissionDecision"], "allow")   # même appel, id changé
+        other = {**hook, "tool_input": {"command": "x" * 4100 + " ; rm -rf ~"}, "tool_use_id": "u4"}
+        self.assertEqual(hs(other)["permissionDecision"], "ask")      # mêmes 4 000 premiers caractères : autre appel
+        self.assertEqual(hs({**hook, "session_id": "autre", "tool_use_id": "u5"})["permissionDecision"], "allow")  # décideur sûr
+        allowed = server.Handler.engine._by_key[("claude/p", "u5")]["decision_id"]
+        st, _ = self.call("POST", "/hooks/claude/answer", {"decision_id": allowed, "action": "deny", "note": "finalement non"})
+        r = hs({**hook, "session_id": "autre", "tool_use_id": "u5"})   # deny humain : l'emporte sur l'allow du décideur
+        self.assertEqual((st, r["permissionDecision"], r["permissionDecisionReason"]), (200, "deny", "Reason[human] finalement non"))
+        self.call("POST", "/hooks/claude/answer", {"decision_id": did, "action": "deny"})
+        r = hs({**hook, "tool_use_id": "u6"})                          # réponse la plus récente : deny remplace l'allow
+        self.assertEqual((r["permissionDecision"], "updatedInput" in r), ("deny", False))
+        orig = server.Handler.engine.decide
+        server.Handler.engine.decide = lambda *a, **k: (_ for _ in ()).throw(core.InProgress("en cours"))
+        try:
+            st, r = self.call("POST", "/hooks/claude", {**hook, "tool_use_id": "u7"})
+        finally:
+            server.Handler.engine.decide = orig
+        self.assertEqual((st, r["hookSpecificOutput"]["permissionDecision"]), (200, "ask"))
+
+    def test_claude_hook_answer_rejects_forgery_and_survives_bad_lines(self):
+        self.dec.answers[:0] = [typed("allow", conf=0.1, params={}) for _ in range(3)]   # v1 v2 v3
+        hook = {"hook_event_name": "PreToolUse", "session_id": "s-sec", "cwd": "/tmp/sec", "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf build"}, "tool_use_id": "v1"}
+        hs = lambda body: self.call("POST", "/hooks/claude", body)[1]["hookSpecificOutput"]
+        hs(hook)
+        did = server.Handler.engine._by_key[("claude/sec", "v1")]["decision_id"]
+        sha = server.Handler.engine._by_id[did]["request"]["event"]["tool_input_sha256"]
+        self.dec.answers[:0] = [typed("allow", params={})]
+        forged = self.call("POST", "/decide", {**req(namespace="claude/sec", run_id="s-sec", candidate_actions=[
+            {"name": "allow", "schema": {"type": "object"}}]), "event": {"type": "tool_call", "tool_input": "ls",
+                                                                         "tool_input_sha256": sha, "hook_mac": "0" * 64}})[1]
+        self.assertEqual(self.call("POST", "/hooks/claude/answer", {"decision_id": forged["decision_id"], "action": "allow"})[0], 400)
+        self.assertEqual(self.call("POST", "/hooks/claude/answer", {"decision_id": [1], "action": "allow"})[0], 400)
+        p = Path(self.tmp) / "claude/sec/hook_answers.jsonl"
+        p.write_text('{"tronq\n[1]\n{"decision_id": "x"}\n')               # lignes illisibles : ignorées
+        self.assertEqual(self.call("POST", "/hooks/claude/answer", {"decision_id": did, "action": "allow"})[0], 200)
+        self.assertEqual(hs({**hook, "tool_use_id": "v2"})["permissionDecision"], "allow")
+        self.assertEqual(hs({**hook, "tool_name": "mcp__shell__exec", "tool_use_id": "v3"})["permissionDecision"], "ask")
+
     def test_claude_hook_gate_and_context(self):
         # le faux décideur répond "allow" (dans l'enum du hook) : mappé sur permissionDecision allow
         self.dec.answers[:0] = [typed("allow", params={}) for _ in range(6)]
