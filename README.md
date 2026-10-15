@@ -11,6 +11,8 @@ Deterministic rules first, a cheap typed decider second, a reasoning model only 
 
 `Python ≥ 3.11` · `zero dependencies` · `MIT` · `HTTP · MCP · Claude Code hooks`
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/4n0nn43x-reason-1c3u98?v=49892b1befeafedf7c629480662a8e3d)](https://m8ven.ai/mcp/4n0nn43x-reason-1c3u98?s=readme)
+
 Release notes and version history: [CHANGELOG.md](CHANGELOG.md).
 
 </div>
