@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import calib
-from .core import Engine, base_result
+from .core import META_ACTIONS, Engine, base_result
 from .llm import LLMError
 from .rules import parse_instant
 
@@ -295,3 +295,21 @@ def fingerprint(engine: Engine) -> dict:
     store.parent.mkdir(parents=True, exist_ok=True)
     store.write_text(json.dumps(cur, ensure_ascii=False, indent=1))
     return {"report": report}
+
+
+def _settled(engine: Engine, ns: str) -> list[tuple[dict, dict | None]]:
+    """(enregistrement, issue ou None) des décisions du namespace, dans l'ordre chronologique."""
+    engine.refresh()
+    with engine._lock:
+        items = [(r, engine._outcomes.get(did)) for did, r in engine._by_id.items() if r["request"]["namespace"] == ns]
+    return sorted(items, key=lambda x: x[0]["ts"])
+
+
+def _expected(dec: dict, o: dict | None) -> str | None:
+    """Action correcte connue : correction humaine, sinon l'action prise si l'issue est un succès."""
+    if not o or base_result(o) == "unknown":
+        return None
+    hf = o.get("human_feedback") or {}
+    exp = hf.get("correct_action") or (dec["action"]["name"] if base_result(o) == "success" else None)
+    return None if exp in META_ACTIONS else exp
+

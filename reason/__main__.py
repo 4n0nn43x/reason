@@ -1,5 +1,5 @@
 """CLI : reason serve | decide | outcome | execute | estimate | estimate-outcome | lessons | rules | eval | outcomes |
-calibrate | poll | pending | fingerprint | init"""
+calibrate | poll | pending | fingerprint | bench | init"""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from .bench import run as bench_run
 from .core import Engine
 from .evalrun import (calibration_report, compare_lessons, counterfactual_lessons, fingerprint, fit_calibration,
                       fit_decision_calibration, outcome_summary, replay)
@@ -62,6 +63,12 @@ def main(argv=None) -> int:
     pl = sub.add_parser("poll"); pl.add_argument("--loop", action="store_true"); pl.add_argument("--interval", type=int, default=300)
     pd = sub.add_parser("pending"); pd.add_argument("namespace")
     sub.add_parser("fingerprint")
+    b = sub.add_parser("bench", help="banc de preuve : invariants en volume, graines fixes")
+    b.add_argument("--n", type=int, default=3000); b.add_argument("--seed", type=int, default=0)
+    b.add_argument("--crash-rounds", type=int, default=20)
+    b.add_argument("--namespace", help="ajoute les baselines sur les issues réelles de ce namespace")
+    b.add_argument("--live", type=int, default=0, metavar="N",
+                   help="N cas d'injection contre le décideur configuré (au moins 2 appels modèle facturés par cas, plus avec n_samples ou un raisonneur)")
     i = sub.add_parser("init"); i.add_argument("namespace")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
@@ -122,6 +129,10 @@ def main(argv=None) -> int:
         out = eng.prune(a.namespace, a.days)
     elif a.cmd == "fingerprint":
         out = fingerprint(eng)
+    elif a.cmd == "bench":
+        out = bench_run(a.n, a.seed, a.crash_rounds, eng, a.namespace, a.live)
+        if not out["ok"]:
+            print(json.dumps(out, ensure_ascii=False, indent=1)); return 1
     elif a.cmd == "init":
         d = eng.ns_dir(a.namespace)
         for name, content in (("rules.json", json.dumps(EXAMPLE_RULES, ensure_ascii=False, indent=1)), ("policy.md", EXAMPLE_POLICY)):

@@ -361,6 +361,14 @@ rejoue le jeu de régression trois fois sur les mêmes cas (leçons actives, dé
 
 Ordres de grandeur à garder en tête : distinguer un taux de réussite de 55 % de 50 % demande environ 600 à 800 issues indépendantes ; 52 % de 50 %, environ 4 000 à 6 600.
 
+**Banc de preuve.**
+
+```bash
+python -m reason bench --namespace acme/invoices
+```
+
+vérifie les invariants en volume, à graines fixes et sans réseau, en une dizaine de secondes : un décideur hostile qui propose toujours l'action interdite ou des paramètres hors bornes (règles), un décideur crédule qui obéit à toute consigne cachée dans `event`, `state` ou `history` (injection), un fournisseur qui échoue 10 % du temps par timeout, 429, réponse non JSON ou schéma faux (fournisseurs), 8 requêtes simultanées par clé d'idempotence (concurrence), un `SIGKILL` à un instant aléatoire d'une boucle de décisions puis un redémarrage sur le même `data_dir` (crash), et une leçon canari plus 1 000 noms de namespace fuzzés (isolation). Chaque suite donne ses échecs et la borne supérieure à 95 % du taux d'échec (3 000 cas sans échec : moins de 0,1 %) ; la commande sort en 1 au moindre échec. `--namespace` ajoute des baselines sur les issues enregistrées (Reason contre l'escalade systématique et contre l'action majoritaire apprise sur les 70 % anciens), `--live N` mesure combien de fois le décideur configuré se laisse détourner par les charges d'injection (au moins 2 appels modèle facturés par cas, plus avec `n_samples` ou un raisonneur, dans un `data_dir` jetable).
+
 ## Modèle de sécurité
 
 - `REASON_TOKEN` défini → `Authorization: Bearer` obligatoire sur tout sauf `/health` (comparaison à temps constant). Liez le service à `127.0.0.1` ou placez un proxy devant.
@@ -379,6 +387,7 @@ reason/
   jev.py         adaptateur Jev (TypeSafe), même interface chat()
   lessons.py     playbook par namespace : compteurs, dédup, élagage, file d'attente
   reflector.py   échec → propositions de leçons
+  bench.py       banc de preuve : règles, injection, fournisseurs, concurrence, crash, isolation, baselines
   evalrun.py     rejeu de régression (pass@1, pass^k), empreinte de modèle
   server.py      HTTP, MCP JSON-RPC, hook Claude Code
   core.py        moteur : validation, paliers, journal, issue v2, post-mortems, estimate, execute
@@ -386,7 +395,7 @@ reason/
   calib.py       Brier, log-loss, RPS, décomposition de Murphy, Platt, Wilson, bootstrap (stdlib)
   poller.py      issues différées : sources JSONL / HTTP / GraphQL, watermark, appariement, horizon
   vault.py       vault markdown : leçons en frontmatter, propositions, post-mortems (ne réécrit jamais un fichier existant)
-  __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
+  __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
 tests/test_reason.py         60 tests hors ligne

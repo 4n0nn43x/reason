@@ -361,6 +361,14 @@ python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after
 
 需要牢记的数量级：要区分 55 % 与 50 % 的命中率，大约需要 600 到 800 个独立结果；区分 52 % 与 50 %，大约需要 4 000 到 6 600 个。
 
+**证明测试台。**
+
+```bash
+python -m reason bench --namespace acme/invoices
+```
+
+以固定随机种子、无网络的方式批量验证不变量，大约十秒：总是提议被禁止动作或越界参数的恶意决策器（规则），服从 `event`、`state` 或 `history` 中隐藏指令的轻信决策器（注入），10 % 的请求以超时、429、非 JSON 或错误 schema 失败的提供方（提供方），每个幂等键 8 个并发请求（并发），在决策循环的随机时刻 `SIGKILL` 后在同一 `data_dir` 上重启（崩溃），以及一条金丝雀经验加 1 000 个模糊测试的命名空间名称（隔离）。每个套件报告失败数和失败率的 95 % 上界（3 000 个用例无失败：低于 0.1 %）；任何失败都会以退出码 1 结束。`--namespace` 会基于已记录的结果加入基线（Reason 对比始终升级、以及在较早 70 % 上学到的多数动作），`--live N` 衡量所配置的决策器被注入载荷劫持的频率（每个用例至少 2 次计费的模型调用，使用 `n_samples` 或推理器时更多，在一次性的 `data_dir` 中）。
+
 ## 安全模型
 
 - 设置了 `REASON_TOKEN` 后，除 `/health` 外一切请求都要求 `Authorization: Bearer`（常量时间比较）。绑定 `127.0.0.1` 或前置代理。
@@ -379,6 +387,7 @@ reason/
   jev.py         Jev（TypeSafe）适配器，相同的 chat() 接口
   lessons.py     按命名空间的经验手册：计数器、去重、修剪、待审队列
   reflector.py   失败 → 经验提案
+  bench.py       证明测试台：规则、注入、提供方、并发、崩溃、隔离、基线
   evalrun.py     回归回放（pass@1、pass^k）、模型指纹
   server.py      HTTP、MCP JSON-RPC、Claude Code 钩子
   core.py        引擎：校验、层级、日志、outcome v2、复盘、estimate、execute
@@ -386,7 +395,7 @@ reason/
   calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
   poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
   vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
-  __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
+  __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
 tests/test_reason.py         60 个离线测试

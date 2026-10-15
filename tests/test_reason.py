@@ -1213,5 +1213,38 @@ class TestAnalysisFixes(unittest.TestCase):
         self.assertEqual(a.decide(req(run_id="t2", idempotency_key="k1"))["decision_id"], box["d"]["decision_id"])
 
 
+
+class TestBench(unittest.TestCase):
+    def test_suites_pass_and_detect_a_broken_guard(self):
+        from reason import bench
+        rep = bench.run(n=150, crash_rounds=2)
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual({s["suite"] for s in rep["suites"]},
+                         {"rules", "injection", "providers", "concurrency", "isolation", "crash"})
+        orig = core.Rules.forbidden
+        core.Rules.forbidden = lambda self, req: {}       # règle inopérante : le banc doit le voir
+        try:
+            self.assertGreater(bench.suite_rules(150, 0)["failures"], 0)
+        finally:
+            core.Rules.forbidden = orig
+            bench.cleanup()
+
+    def test_baselines_on_recorded_outcomes(self):
+        from reason import bench
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve")] * 6 + [typed("escalate", conf=0.1)] * 4))
+        ds = [eng.decide(req(run_id=f"r{i}")) for i in range(10)]   # avant les issues : le réflecteur partage le faux LLM
+        for i, d in enumerate(ds):
+            fb = {"correct_action": "escalate"} if i % 3 == 0 else None
+            eng.outcome({"decision_id": d["decision_id"], "result": "success" if not fb else "failure",
+                         **({"human_feedback": fb} if fb else {})})
+        b = bench.baselines(eng, "acme/invoices")
+        self.assertEqual((b["settled"], b["test_n"]), (10, 3))
+        self.assertEqual(b["majority_action"]["action"], "approve")
+        self.assertEqual(b["majority_action"]["error_rate"], 1.0)   # seule étiquette du test : escalate (correction humaine)
+        self.assertEqual(b["reason"]["escalation_rate"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

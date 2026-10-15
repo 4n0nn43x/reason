@@ -443,6 +443,18 @@ python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after
 
 مراتب حجم للتذكّر: التمييز بين معدل نجاح 55 % و50 % يتطلب نحو 600 إلى 800 نتيجة مستقلة؛ و52 % مقابل 50 % نحو 4000 إلى 6600.
 
+**منصّة الإثبات.**
+
+</div>
+
+```bash
+python -m reason bench --namespace acme/invoices
+```
+
+<div dir="rtl">
+
+يتحقق من الثوابت على نطاق واسع، ببذور ثابتة ومن دون شبكة، في نحو عشر ثوانٍ: مقرِّر عدائي يقترح دائماً الإجراء المحظور أو معاملات خارج الحدود (القواعد)، ومقرِّر ساذج يطيع أي تعليمات مخفية في `event` أو `state` أو `history` (الحقن)، ومزوّد يفشل في 10 % من الحالات بمهلة أو 429 أو رد غير JSON أو مخطط خاطئ (المزوّدون)، و8 طلبات متزامنة لكل مفتاح تكرار (التزامن)، و`SIGKILL` في لحظة عشوائية من حلقة قرارات ثم إعادة تشغيل على `data_dir` نفسه (الانهيار)، ودرس كناري مع 1000 اسم نطاق مُولَّد عشوائياً (العزل). تعطي كل مجموعة عدد إخفاقاتها والحد الأعلى بنسبة 95 % لمعدل الإخفاق (3000 حالة بلا إخفاق: أقل من 0.1 %)؛ ويخرج الأمر بالرمز 1 عند أي إخفاق. يضيف `--namespace` خطوط أساس على النتائج المسجّلة (Reason مقابل التصعيد الدائم ومقابل الإجراء الأكثر تكراراً المتعلَّم على أقدم 70 %)، ويقيس `--live N` عدد مرات انحراف المقرِّر المُعدّ بفعل حمولات الحقن (استدعاءان مدفوعان للنموذج على الأقل لكل حالة، وأكثر مع `n_samples` أو مُستدِل، في `data_dir` مؤقت).
+
 ## نموذج الأمان
 
 - عند ضبط `REASON_TOKEN` يصبح `Authorization: Bearer` إلزامياً على كل شيء عدا `/health` (مقارنة بزمن ثابت). اربط الخدمة بـ `127.0.0.1` أو ضع وكيلاً أمامها.
@@ -463,6 +475,7 @@ reason/
   jev.py         محوّل Jev (TypeSafe)، واجهة chat() نفسها
   lessons.py     دفتر الدروس لكل نطاق: عدّادات، إزالة تكرار، تقليم، طابور انتظار
   reflector.py   فشل → مقترحات دروس
+  bench.py       منصّة الإثبات: القواعد، الحقن، المزوّدون، التزامن، الانهيار، العزل، خطوط الأساس
   evalrun.py     إعادة تشغيل الانحدار (pass@1، pass^k)، بصمة النموذج
   server.py      HTTP، MCP JSON-RPC، خطاف Claude Code
   core.py        المحرّك: التحقق، الطبقات، السجل، outcome v2، المراجعات اللاحقة، estimate، execute
@@ -470,7 +483,7 @@ reason/
   calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
   poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
   vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
-  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
 tests/test_reason.py         60 اختباراً دون شبكة

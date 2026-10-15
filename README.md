@@ -361,6 +361,14 @@ replays the regression set three times on the same cases (lessons on, off, delib
 
 Orders of magnitude to keep in mind: telling a 55 % hit rate from 50 % takes roughly 600 to 800 independent outcomes; 52 % from 50 %, about 4 000 to 6 600.
 
+**Proof bench.**
+
+```bash
+python -m reason bench --namespace acme/invoices
+```
+
+runs the invariants at volume, with fixed seeds and no network, in about ten seconds: a hostile decider that always proposes the forbidden action or out-of-bounds parameters (rules), a gullible decider that obeys any instruction hidden in `event`, `state` or `history` (injection), a provider failing 10 % of the time with timeouts, 429s, non-JSON and wrong schemas (providers), 8 simultaneous requests per idempotency key (concurrency), `SIGKILL` at random points of a decision loop then restart on the same `data_dir` (crash), and a canary lesson plus 1 000 fuzzed namespace names (isolation). Each suite reports its failures and the 95 % upper bound on the failure rate (3 000 cases without a failure: under 0.1 %); the command exits with 1 on any failure. `--namespace` adds baselines on recorded outcomes (Reason against always escalating and against the majority action learned on the older 70 %), `--live N` measures how often the configured decider is hijacked by the injection payloads (at least 2 billed model calls per case, more with `n_samples` or a reasoner, in a throwaway `data_dir`).
+
 ## Security model
 
 - `REASON_TOKEN` set → `Authorization: Bearer` required on everything except `/health` (constant-time comparison). Bind to `127.0.0.1` or put a proxy in front.
@@ -379,6 +387,7 @@ reason/
   jev.py         Jev (TypeSafe) adapter, same chat() interface
   lessons.py     per-namespace playbook: counters, dedup, pruning, pending queue
   reflector.py   failure → lesson proposals
+  bench.py       proof bench: rules, injection, providers, concurrency, crash, isolation, baselines
   evalrun.py     regression replay (pass@1, pass^k), model fingerprint
   server.py      HTTP, MCP JSON-RPC, Claude Code hook
   core.py        engine: validation, tiers, journal, outcome v2, post-mortems, estimate, execute
@@ -386,7 +395,7 @@ reason/
   calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
   poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
-  __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint init
+  __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests
