@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **MCP 2026-07-28 (stateless) alongside 2025-11-25.** `/mcp` picks the era per request: a request carrying `_meta["io.modelcontextprotocol/protocolVersion"]` or `MCP-Protocol-Version: 2026-07-28` gets `server/discover`, `resultType`, `ttlMs`/`cacheScope` on `tools/list`, server identity in `_meta`, and the spec's header checks (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, base64 sentinel decoded) with HTTP 400 and codes -32602, -32020, -32022; unknown methods (including `initialize`, `ping`) give 404. Legacy clients see no change.
+- MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) on the five tools.
+
+### Fixed
+- `Content-Length` is validated (digits only, single value, no `Transfer-Encoding`), else 400 and the connection is closed.
+- A concurrent request with the same `idempotency_key` still in progress gets HTTP 409.
+- `estimate` tolerates failed samples and reports `n_requested`; `estimate_outcome` and namespace reads refresh from disk first; `prune` evicts removed decisions from memory in other processes.
+
 ## 0.3.0 (2026-10-10)
 
 Driven by three independent reviews and a research pass on trading models: measure, do not assert.

@@ -6,6 +6,7 @@ Stdlib uniquement (ThreadingHTTPServer).
 """
 from __future__ import annotations
 
+import base64
 import fnmatch
 import hashlib
 import hmac
@@ -53,6 +54,8 @@ MCP_TOOLS = [
     _tool("estimate_outcome", "Résoudre une estimation", "Résout une estimation (issue réelle) pour la scorer (Brier, log-loss) et créditer les leçons.",
           ESTIMATE_OUTCOME_SCHEMA, destructive=True, idempotent=True, open_world=False),
 ]
+META_VERSION = "io.modelcontextprotocol/protocolVersion"
+MODERN_VERSIONS = ("2026-07-28",)          # versions sans initialize ; les clients 2025-11-25 passent par initialize
 SCOPE = {"decide": "decide", "outcome": "outcome", "execute": "execute", "estimate": "estimate", "estimate_outcome": "estimate"}
 
 
@@ -228,15 +231,28 @@ class Handler(BaseHTTPRequestHandler):
             params = {}
         if not isinstance(params, dict):
             return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "params doit être un objet"}})
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        modern = META_VERSION in meta or self.headers.get("MCP-Protocol-Version") in MODERN_VERSIONS
+        if modern:                     # MCP 2026-07-28 : sans état, version et capacités portées par chaque requête
+            bad = self._mcp_modern_error(method, params, meta)
+            if bad:
+                status, code, message, data = bad
+                err = {"code": code, "message": message, **({"data": data} if data else {})}
+                return self._json(status, {"jsonrpc": "2.0", "id": rid, "error": err})
         try:
-            if method == "initialize":
+            if method == "server/discover":
+                result = {"supportedVersions": list(MODERN_VERSIONS), "capabilities": {"tools": {}},
+                          "instructions": "Reason : décisions bornées (règles, puis modèle typé, puis humain) pour des "
+                                          "automatisations. Appeler decide avant toute action irréversible, puis outcome.",
+                          "ttlMs": 0, "cacheScope": "public"}
+            elif method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-11-25"),
                           "capabilities": {"tools": {"listChanged": False}},
                           "serverInfo": {"name": "reason", "version": __version__}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": MCP_TOOLS}
+                result = {"tools": MCP_TOOLS, "ttlMs": 0, "cacheScope": "public"}   # liste identique pour tous les jetons
             elif method == "tools/call":
                 name, args = params.get("name"), params.get("arguments") or {}
                 fn = getattr(self.engine, name) if name in SCOPE else None
@@ -254,7 +270,30 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             return self._json(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(e)}})
+        result["resultType"] = "complete"          # exigé en 2026-07-28, ignoré par les clients antérieurs
+        if modern:
+            result["_meta"] = {"io.modelcontextprotocol/serverInfo": {"name": "reason", "version": __version__}}
         return self._json(200, {"jsonrpc": "2.0", "id": rid, "result": result})
+
+    def _mcp_modern_error(self, method: str, params: dict, meta: dict):
+        """Validation d'une requête MCP 2026-07-28 (basic/index « _meta », transports/streamable-http « Server Validation »).
+        Retourne (statut HTTP, code JSON-RPC, message, data) ou None."""
+        version = meta.get(META_VERSION)
+        if not isinstance(version, str) or not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
+            return 400, -32602, "_meta : protocolVersion et clientCapabilities sont requis", None
+        if self.headers.get("MCP-Protocol-Version") != version:
+            return 400, -32020, "en-tête MCP-Protocol-Version absent ou différent de _meta", None
+        if version not in MODERN_VERSIONS:
+            return 400, -32022, f"version de protocole non prise en charge : {version}", \
+                {"supported": list(MODERN_VERSIONS), "requested": version}
+        if self.headers.get("Mcp-Method") != method:
+            return 400, -32020, "en-tête Mcp-Method absent ou différent de method", None
+        name = _header_value(self.headers.get("Mcp-Name"))
+        if method == "tools/call" and (name is None or name != params.get("name")):
+            return 400, -32020, "en-tête Mcp-Name absent ou différent de params.name", None
+        if method not in ("server/discover", "tools/list", "tools/call"):   # initialize et ping n'existent plus
+            return 404, -32601, f"méthode inconnue {method}", None
+        return None
 
     # --- hook http Claude Code : le gate « décider avant l'action »
     def _claude_hook(self, h: dict) -> dict:
@@ -282,6 +321,16 @@ class Handler(BaseHTTPRequestHandler):
                 return {}
             return {"hookSpecificOutput": {"hookEventName": ev, "additionalContext": "Leçons Reason pour ce projet :\n" + text}}
         return {}
+
+
+def _header_value(v: str | None) -> str | None:
+    """Décode la forme sentinelle =?base64?…?= (streamable-http « Value Encoding ») ; None si absent ou illisible."""
+    if v and v.startswith("=?base64?") and v.endswith("?="):
+        try:
+            return base64.b64decode(v[9:-2], validate=True).decode("utf-8")
+        except ValueError:
+            return None
+    return v
 
 
 def hook_namespace(cwd: str | None) -> str:

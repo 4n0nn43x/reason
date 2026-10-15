@@ -334,6 +334,38 @@ class TestServer(unittest.TestCase):
         c.request("POST", "/mcp", "{}", {"Authorization": "Bearer secret", "Origin": "https://evil.example"})
         self.assertEqual(c.getresponse().status, 403)
 
+    def test_mcp_2026_07_28_stateless(self):
+        def mcp(method, params=None, version="2026-07-28", headers=None, meta=True):
+            p = dict(params or {})
+            if meta:
+                p["_meta"] = {"io.modelcontextprotocol/protocolVersion": version,
+                              "io.modelcontextprotocol/clientCapabilities": {}}
+            h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                 "Authorization": "Bearer secret", "MCP-Protocol-Version": version, "Mcp-Method": method,
+                 **({"Mcp-Name": p["name"]} if "name" in p else {}), **(headers or {})}
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": p}), h)
+            r = c.getresponse(); return r.status, json.loads(r.read())
+        st, r = mcp("server/discover")                                          # sans initialize
+        self.assertEqual((st, r["result"]["supportedVersions"], r["result"]["resultType"]), (200, ["2026-07-28"], "complete"))
+        self.assertEqual(r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "reason")
+        st, r = mcp("tools/list")
+        self.assertEqual((st, r["result"]["ttlMs"], r["result"]["cacheScope"], len(r["result"]["tools"])), (200, 0, "public", 5))
+        st, r = mcp("tools/call", {"name": "decide", "arguments": req(run_id="mcp-2026")},
+                    headers={"Mcp-Name": "=?base64?ZGVjaWRl?="})                    # « decide » encodé en base64
+        self.assertEqual((st, r["result"]["isError"], r["result"]["resultType"]), (200, False, "complete"))
+        self.assertEqual(mcp("tools/call", {"name": "decide", "arguments": {}}, headers={"Mcp-Name": "outcome"})[1]["error"]["code"], -32020)
+        self.assertEqual(mcp("tools/call", {"arguments": {}})[:1], (400,))                    # ni name ni Mcp-Name
+        st, r = mcp("tools/list", headers={"Mcp-Method": "tools/call"})
+        self.assertEqual((st, r["error"]["code"]), (400, -32020))
+        st, r = mcp("tools/list", version="2099-01-01")
+        self.assertEqual((st, r["error"]["code"], r["error"]["data"]), (400, -32022, {"supported": ["2026-07-28"], "requested": "2099-01-01"}))
+        self.assertEqual(mcp("tools/list", meta=False)[1]["error"]["code"], -32602)          # en-tête 2026 sans _meta
+        st, r = mcp("ping")
+        self.assertEqual((st, r["error"]["code"]), (404, -32601))
+        st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 9, "method": "tools/list"})   # client 2025-11-25 inchangé
+        self.assertEqual((st, len(r["result"]["tools"]), "_meta" in r["result"]), (200, 5, False))
+
     def test_claude_hook_gate_and_context(self):
         # le faux décideur répond "allow" (dans l'enum du hook) : mappé sur permissionDecision allow
         self.dec.answers[:0] = [typed("allow", params={}) for _ in range(6)]
