@@ -1245,6 +1245,103 @@ class TestBench(unittest.TestCase):
         self.assertEqual(b["reason"]["escalation_rate"], 1.0)
 
 
+class TestShadowAndSimulation(unittest.TestCase):
+    def test_shadow_challenger_logged_and_compared(self):
+        tmp = tempfile.mkdtemp()
+        champ = FakeLLM("d", [typed("approve")] * 4)
+        by_amount = {1: typed("escalate"), 2: typed("approve"), 3: LLMError("down"), 4: typed("approve")}
+        pick = lambda m: by_amount[json.loads(m[-1]["content"])["state"]["facts"]["amount"]]   # indépendant de l'ordre des threads
+        chall = FakeLLM("c", [pick] * 4)
+        eng = engine(tmp, decider=champ)
+        eng.models["c"] = chall
+        eng.config["shadow"] = {"acme/*": {"decider": "c"}}
+        ds = [eng.decide(req(run_id=f"r{i}", state={"facts": {"amount": i + 1}})) for i in range(4)]
+        eng._shadow_q.join()
+        self.assertEqual(len(champ.calls), 4)                 # le champion n'est appelé qu'une fois par décision
+        self.assertTrue(all(d["action"]["name"] == "approve" for d in ds))  # le challenger ne change rien au service
+        eng.outcome({"decision_id": ds[0]["decision_id"], "result": "failure",
+                     "human_feedback": {"correct_action": "escalate"}})
+        eng.outcome({"decision_id": ds[1]["decision_id"], "result": "success"})
+        from reason.evalrun import shadow_report
+        rep = shadow_report(eng, "acme/invoices")
+        self.assertEqual((rep["shadowed"], rep["errors"]), (4, 0))   # challenger en panne : il escalade, comme en production
+        self.assertEqual((rep["agreement"], rep["challenger_escalation_rate"]), (0.5, 0.25))
+        self.assertEqual((rep["paired"]["challenger_wins"], rep["paired"]["both_right"]), (1, 1))
+        rid = [d["decision_id"] for d in ds]
+        rows = [json.loads(l) for l in (Path(tmp) / "acme/invoices/shadow.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted(r["decision_id"] for r in rows), sorted(rid))
+
+    def test_shadow_skips_rules_and_replays(self):
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve")]))
+        eng.models["c"] = FakeLLM("c", [])
+        eng.config["shadow"] = {"*": {"decider": "c"}}
+        (Path(tmp) / "acme/invoices").mkdir(parents=True)
+        (Path(tmp) / "acme/invoices/rules.json").write_text(json.dumps(
+            [{"id": "big", "if": [{"path": "state.facts.amount", "op": "gt", "value": 5000}], "decide": {"name": "escalate"}}]))
+        eng.decide(req(state={"facts": {"amount": 9000}}))
+        eng.decide(req(idempotency_key="k"))
+        eng.decide(req(idempotency_key="k"))
+        eng._shadow_q.join()
+        rows = (Path(tmp) / "acme/invoices/shadow.jsonl").read_text().splitlines()
+        self.assertEqual(len(rows), 1)                         # ni la règle, ni le rejeu idempotent
+
+    def test_simulate_rules_on_history(self):
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve")] * 3 + [typed("escalate", conf=0.1)]))
+        amounts = [900, 6000, 7000, 8000]
+        ds = [eng.decide(req(run_id=f"r{i}", state={"facts": {"amount": a}})) for i, a in enumerate(amounts)]
+        eng.outcome({"decision_id": ds[0]["decision_id"], "result": "success"})
+        eng.outcome({"decision_id": ds[1]["decision_id"], "result": "failure"})
+        eng.outcome({"decision_id": ds[2]["decision_id"], "result": "success"})
+        eng.outcome({"decision_id": ds[3]["decision_id"], "result": "success", "human_feedback": {"correct_action": "escalate"}})
+        from reason.evalrun import simulate_rules
+        cap = [{"id": "cap", "if": [{"path": "state.facts.amount", "op": "gt", "value": 5000}], "forbid": ["approve"]},
+               {"id": "big", "if": [{"path": "state.facts.amount", "op": "gt", "value": 7500}], "decide": {"name": "escalate"}}]
+        rep = simulate_rules(eng, "acme/invoices", cap)
+        self.assertEqual((rep["decisions"], rep["changed"], rep["newly_blocked"], rep["newly_forced"]), (4, 3, 2, 1))
+        self.assertEqual((rep["errors_avoided"], rep["new_escalations_on_success"], rep["escalations_automated_right"]), (1, 1, 1))
+        self.assertEqual(rep["lint"], [])
+
+    def test_simulate_matches_engine_on_ignored_rules(self):
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve")] * 3), thresholds={"loop_max_repeats": 1})
+        (Path(tmp) / "acme/invoices").mkdir(parents=True)
+        (Path(tmp) / "acme/invoices/rules.json").write_text(json.dumps(
+            [{"id": "esc", "if": [{"path": "state.facts.amount", "op": "gt", "value": 5000}], "decide": {"name": "escalate"}}]))
+        eng.decide(req(run_id="a", state={"facts": {"amount": 100}}))
+        loop = eng.decide(req(run_id="a", state={"facts": {"amount": 100}}))          # anti-boucle avant les règles
+        ruled = eng.decide(req(run_id="b", state={"facts": {"amount": 9000}}))
+        self.assertEqual((loop["tier"], ruled["tier"]), ("loop", "rules"))
+        from reason.evalrun import simulate_rules
+        bad_params = [{"id": "x", "if": [{"path": "state.facts.amount", "op": "gte", "value": 0}],
+                       "decide": {"name": "approve", "params": {"limit": "oops"}}}]
+        rep = simulate_rules(eng, "acme/invoices", bad_params)     # params hors schéma : règle ignorée par le moteur
+        self.assertEqual((rep["newly_forced"], rep["released_to_model"]), (0, 1))
+        forced_forbidden = [{"id": "f", "if": [{"path": "state.facts.amount", "op": "gt", "value": 5000}],
+                             "decide": {"name": "approve", "params": {"limit": 1}}, "forbid": ["approve"]}]
+        rep = simulate_rules(eng, "acme/invoices", forced_forbidden)
+        self.assertEqual((rep["changed"], rep["released_to_model"]), (1, 1))
+        with self.assertRaises(ValueError):
+            simulate_rules(eng, "acme/invoices", {"id": "pas une liste"})
+
+    def test_shadow_bad_config_and_exit_do_not_hurt_service(self):
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve")]))
+        eng.config["shadow"] = ["acme/*"]                         # config invalide : la décision est quand même servie
+        self.assertEqual(eng.decide(req())["action"]["name"], "approve")
+        script = ("import sys, time; sys.path[:0] = [%r, %r]\n"
+                  "from test_reason import engine, FakeLLM, typed, req\n"
+                  "eng = engine(%r, decider=FakeLLM('d', [typed('approve')]))\n"
+                  "eng.models['c'] = FakeLLM('c', [lambda m: time.sleep(5) or typed('approve')])\n"
+                  "eng.config['shadow'] = {'*': {'decider': 'c'}}\n"
+                  "eng.decide(req())\n") % (str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1]),
+                                              tempfile.mkdtemp())
+        t = time.perf_counter()
+        subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
+        self.assertLess(time.perf_counter() - t, 3)               # le processus n'attend pas le challenger lent
+
+
 if __name__ == "__main__":
     unittest.main()
 

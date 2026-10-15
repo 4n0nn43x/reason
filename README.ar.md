@@ -443,6 +443,20 @@ python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after
 
 مراتب حجم للتذكّر: التمييز بين معدل نجاح 55 % و50 % يتطلب نحو 600 إلى 800 نتيجة مستقلة؛ و52 % مقابل 50 % نحو 4000 إلى 6600.
 
+**وضع الظل (البطل / المنافس).** مع `"shadow": {"acme/*": {"decider": "challenger-model"}}` في الإعدادات، يُعاد اتخاذ كل قرار يتخذه نموذج في نطاق مطابق بواسطة المنافس، تجريبياً في خيط خلفي: لا شيء يُنفَّذ، والقرار المُقدَّم لا ينتظره، وتذهب المقارنة إلى `shadow.jsonl`. لا تُكرَّر القرارات المتخذة بقاعدة ولا إعادات التشغيل المتكررة. تحتفظ الطابور بـ 1000 مقارنة (وتُهمَل الزائدة)، ولا تُبقي خيوطه العملية حية، لذا فوضع الظل موجّه إلى `reason serve`: أمر `reason decide` المنفرد ينتهي دون انتظار ويفقد مقارنته. يعطي `python -m reason shadow acme/invoices` نسبة الاتفاق ومعدلات التصعيد والمكاسب والخسائر المزدوجة على القرارات المحسومة مع اختبار إشارة، وما كان المنافس سيفعله في الحالات التي صعّدها البطل. من دون تصحيح بشري، يَسِم النجاحُ إجراءَ البطل بأنه صحيح، وهذا يحابي البطل؛ وحدها التصحيحات تقارن الطرفين بلا انحياز.
+
+**محاكاة القواعد على السجل.**
+
+</div>
+
+```bash
+python -m reason rules acme/invoices simulate --candidate rules.new.json
+```
+
+<div dir="rtl">
+
+يعيد تشغيل القواعد المرشحة على كل طلب مسجَّل، من دون استدعاء نموذج، ويبيّن القرارات التي ستتغير (إجراء مفروض، إجراء صار محظوراً، قاعدة فرض أُزيلت)، وعلى القرارات المحسومة: الأخطاء المتجنَّبة، والأخطاء المُدخَلة، والتصعيدات الجديدة على قرارات كانت ناجحة، والتصعيدات التي ستصبح آلية. يُحتسب الإجراء المحظور تصعيداً مع أن المستوى التالي قد يحسم؛ وتُقيَّم الطلبات كما سُجِّلت، مع إخفاء حقول `redact_paths`، ومقارنةً بملف `rules.json` الحالي (قد تكون القرارات السابقة اتبعت نسخة أقدم).
+
 **منصّة الإثبات.**
 
 </div>
@@ -483,7 +497,7 @@ reason/
   calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
   poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
   vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
-  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
 tests/test_reason.py         60 اختباراً دون شبكة

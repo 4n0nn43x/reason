@@ -361,6 +361,16 @@ python -m reason eval acme/invoices --compare-lessons wrong_lessons.json --after
 
 需要牢记的数量级：要区分 55 % 与 50 % 的命中率，大约需要 600 到 800 个独立结果；区分 52 % 与 50 %，大约需要 4 000 到 6 600 个。
 
+**影子模式（冠军 / 挑战者）。** 在配置中加入 `"shadow": {"acme/*": {"decider": "challenger-model"}}` 后，匹配命名空间中每个由模型做出的决策都会由挑战者在后台线程中以 dry run 再决策一次：不执行任何操作，返回的决策不等待它，比较结果写入 `shadow.jsonl`。由规则做出的决策和幂等重放不做影子决策。队列最多保存 1 000 个比较（超出的会被丢弃），其线程不会让进程保持运行，因此影子模式面向 `reason serve`：一次性的 `reason decide` 不会等待就退出，并丢失其比较。`python -m reason shadow acme/invoices` 报告一致率、升级率、已结算决策上的配对胜负及符号检验，以及挑战者在冠军升级的用例上会如何表现。没有人工更正时，成功会把冠军的动作标为正确，这对冠军有利；只有人工更正能无偏地比较双方。
+
+**基于历史的规则模拟。**
+
+```bash
+python -m reason rules acme/invoices simulate --candidate rules.new.json
+```
+
+在每条已记录的请求上重放候选规则，不调用模型，报告哪些决策会改变（被强制的动作、现在被禁止的动作、被移除的强制规则），并在已结算的决策上报告避免的错误、引入的错误、原本成功的决策上新增的升级，以及现在会被自动化的升级。被禁止的动作按升级计算，尽管下一层可能得出结论；请求按记录时的样子评估，`redact_paths` 字段已被遮蔽，并与当前的 `rules.json` 比较（过去的决策可能遵循旧版本）。
+
 **证明测试台。**
 
 ```bash
@@ -395,7 +405,7 @@ reason/
   calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
   poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
   vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
-  __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
+  __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
 tests/test_reason.py         60 个离线测试

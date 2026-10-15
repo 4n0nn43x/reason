@@ -5,6 +5,8 @@
 ### Added
 - **MCP 2026-07-28 (stateless) alongside 2025-11-25.** `/mcp` picks the era per request: a request carrying `_meta["io.modelcontextprotocol/protocolVersion"]` or `MCP-Protocol-Version: 2026-07-28` gets `server/discover`, `resultType`, `ttlMs`/`cacheScope` on `tools/list`, server identity in `_meta`, and the spec's header checks (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, base64 sentinel decoded) with HTTP 400 and codes -32602, -32020, -32022; unknown methods (including `initialize`, `ping`) give 404. Legacy clients see no change.
 - **Proof bench** `reason bench`: rules against a hostile decider, indirect injection against a gullible one, provider failures (timeouts, 429, non-JSON, wrong schema), concurrency on one idempotency key, `SIGKILL` during decisions then restart, canary lesson and fuzzed namespaces; failures and a 95 % upper bound per suite, exit code 1 on failure. `--namespace` adds baselines on recorded outcomes, `--live N` measures the configured decider's hijack rate.
+- **Shadow mode**: `config.shadow` maps namespace globs to challenger model overrides; model-made decisions are re-decided by the challenger as a background dry run and compared in `shadow.jsonl`. `reason shadow <ns>` reports agreement, escalation rates, paired wins/losses with a sign test.
+- **Rule simulation**: `reason rules <ns> simulate --candidate FILE` replays candidate rules on journaled requests without model calls and reports changed decisions, errors avoided or introduced, and escalations added or automated.
 - MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) on the five tools.
 
 ### Fixed

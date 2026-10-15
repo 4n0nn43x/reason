@@ -8,10 +8,13 @@ executor. Sans decider, l'executor décide lui-même ; sans estimator, le decide
 from __future__ import annotations
 
 import copy
+import fnmatch
 import os
+import queue
 import hashlib
 import json
 import re
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -167,6 +170,7 @@ class Engine:
         self._seen_refs: dict[str, set] = {}                                # decision_id -> source_ref déjà appliqués
         self._journal_offsets: dict[str, int] = {}
         self._journaled: set[str] = set()                                   # ids écrits ou relus dans un journal (purgeables)
+        self._shadow_q: queue.Queue | None = None
         self.refresh()
 
     # --- rôles de modèles
@@ -452,7 +456,7 @@ class Engine:
                     raise InProgress("décision en cours pour cette clé d'idempotence : réessayer avec la même clé")
                 raise LLMError("décision concurrente non aboutie pour cette clé d'idempotence")
         try:
-            return self._decide(req)
+            dec = self._decide(req)
         except BaseException:
             if key:
                 with self._lock:
@@ -460,6 +464,51 @@ class Engine:
                 if isinstance(ev, threading.Event):
                     ev.set()
             raise
+        try:
+            self._shadow(req, dec)
+        except Exception as e:          # config shadow invalide : la décision est déjà journalisée et doit être servie
+            print(f"reason: shadow ignoré ({e})", file=sys.stderr)
+        return dec
+
+    def _shadow(self, req: dict, dec: dict) -> None:
+        """Mode ombre (config["shadow"] : {glob de namespace: surcharges de modèles}) : le challenger décide la même
+        requête en dry run, hors du chemin critique. Rien n'est exécuté ; la comparaison va dans shadow.jsonl."""
+        ns = req["namespace"]
+        ov = next((v for g, v in (self.config.get("shadow") or {}).items() if fnmatch.fnmatchcase(ns, g)), None)
+        if not ov or dec["tier"] in ("rules", "loop"):     # mêmes règles des deux côtés : rien à comparer
+            return
+
+        def run():
+            row = {"decision_id": dec["decision_id"], "decision_point": req["decision_point"], "created_now": req["now"],
+                   "challenger_models": ov, "champion": {"tier": dec["tier"], "action": dec["action"]["name"],
+                                                         "confidence": dec["confidence"]}}
+            try:   # sans run_id : l'anti-boucle compterait la décision du champion
+                ch = self._decide({**req, "run_id": None, "models": {**(req.get("models") or {}), **ov}}, dry_run=True)
+                row["challenger"] = {"tier": ch["tier"], "action": ch["action"]["name"], "params": ch["action"]["params"],
+                                     "confidence": ch["confidence"]}
+                row["agree"] = ch["action"]["name"] == dec["action"]["name"]
+            except Exception as e:      # le challenger ne doit jamais casser le service
+                row["error"] = str(e)[:300]
+            self._append(ns, "shadow.jsonl", row)
+        with self._lock:
+            if self._shadow_q is None:   # threads démons : un processus qui se termine n'attend pas le challenger
+                self._shadow_q = queue.Queue(maxsize=1000)
+                for _ in range(2):
+                    threading.Thread(target=self._shadow_worker, daemon=True, name="reason-shadow").start()
+        try:
+            self._shadow_q.put_nowait(run)
+        except queue.Full:               # ponytail: challenger plus lent que le trafic, comparaison abandonnée
+            pass
+
+    def _shadow_worker(self) -> None:
+        while True:
+            job = self._shadow_q.get()
+            try:
+                job()
+            except Exception:
+                pass
+            finally:
+                self._shadow_q.task_done()
 
     def _lessons_for(self, ns: str, req: dict, mode=None) -> tuple[str, list[str]]:
         """mode (ablation, dry run seulement) : None = playbook normal, "off" = aucune leçon, liste = leçons substituées."""

@@ -361,6 +361,16 @@ rejoue le jeu de régression trois fois sur les mêmes cas (leçons actives, dé
 
 Ordres de grandeur à garder en tête : distinguer un taux de réussite de 55 % de 50 % demande environ 600 à 800 issues indépendantes ; 52 % de 50 %, environ 4 000 à 6 600.
 
+**Mode ombre (champion / challenger).** Avec `"shadow": {"acme/*": {"decider": "modele-challenger"}}` dans la config, chaque décision prise par un modèle dans un namespace correspondant est redécidée par le challenger, en dry run dans un thread d'arrière-plan : rien n'est exécuté, la décision servie ne l'attend pas, et la comparaison va dans `shadow.jsonl`. Les décisions prises par une règle et les rejeux idempotents ne sont pas doublés. La file garde 1 000 comparaisons (les suivantes sont abandonnées) et ses threads ne retiennent pas le processus : le mode ombre vise `reason serve`, un `reason decide` ponctuel se termine sans attendre et perd sa comparaison. `python -m reason shadow acme/invoices` donne l'accord, les taux d'escalade, les victoires et défaites appariées sur les décisions réglées avec un test du signe, et ce qu'aurait fait le challenger sur les cas que le champion a escaladés. Sans correction humaine, un succès étiquette l'action du champion comme juste, ce qui avantage le champion ; seules les corrections comparent les deux sans biais.
+
+**Simulation des règles sur l'historique.**
+
+```bash
+python -m reason rules acme/invoices simulate --candidate rules.new.json
+```
+
+rejoue des règles candidates sur chaque requête journalisée, sans appel modèle, et indique quelles décisions changeraient (action forcée, action désormais interdite, règle forcée retirée) et, sur les décisions réglées, les erreurs évitées, les erreurs introduites, les nouvelles escalades sur des décisions qui avaient réussi et les escalades qui seraient désormais automatisées. Une action interdite est comptée comme une escalade alors que le palier suivant pourrait conclure ; les requêtes sont évaluées telles que journalisées, champs `redact_paths` masqués, face au `rules.json` actuel (les décisions passées ont pu suivre une version antérieure).
+
 **Banc de preuve.**
 
 ```bash
@@ -395,7 +405,7 @@ reason/
   calib.py       Brier, log-loss, RPS, décomposition de Murphy, Platt, Wilson, bootstrap (stdlib)
   poller.py      issues différées : sources JSONL / HTTP / GraphQL, watermark, appariement, horizon
   vault.py       vault markdown : leçons en frontmatter, propositions, post-mortems (ne réécrit jamais un fichier existant)
-  __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
+  __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
 tests/test_reason.py         60 tests hors ligne

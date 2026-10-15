@@ -1,5 +1,5 @@
 """CLI : reason serve | decide | outcome | execute | estimate | estimate-outcome | lessons | rules | eval | outcomes |
-calibrate | poll | pending | fingerprint | bench | init"""
+calibrate | poll | pending | fingerprint | bench | shadow | init"""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ from pathlib import Path
 from .bench import run as bench_run
 from .core import Engine
 from .evalrun import (calibration_report, compare_lessons, counterfactual_lessons, fingerprint, fit_calibration,
-                      fit_decision_calibration, outcome_summary, replay)
+                      fit_decision_calibration, outcome_summary, replay, shadow_report, simulate_rules)
 from .poller import run as poll_run
 from .rules import Rules
 from .server import load_config, serve
@@ -46,8 +46,9 @@ def main(argv=None) -> int:
     l = sub.add_parser("lessons"); l.add_argument("namespace")
     l.add_argument("action", choices=["list", "pending", "approve", "reject", "add", "review"])
     l.add_argument("value", nargs="?")
-    r = sub.add_parser("rules"); r.add_argument("namespace"); r.add_argument("action", choices=["lint", "test"])
+    r = sub.add_parser("rules"); r.add_argument("namespace"); r.add_argument("action", choices=["lint", "test", "simulate"])
     r.add_argument("--cases", help="fichier JSON de cas (défaut: data/<ns>/rules.test.json)")
+    r.add_argument("--candidate", help="simulate : fichier JSON des règles candidates, rejouées sur l'historique")
     e = sub.add_parser("eval"); e.add_argument("namespace"); e.add_argument("-k", type=int, default=1); e.add_argument("--limit", type=int)
     e.add_argument("--lessons", default="on", help="on | off | fichier JSON de leçons substituées (ablation)")
     e.add_argument("--after", help="jeu tenu à l'écart : seulement les décisions postérieures à cette date ISO")
@@ -63,6 +64,7 @@ def main(argv=None) -> int:
     pl = sub.add_parser("poll"); pl.add_argument("--loop", action="store_true"); pl.add_argument("--interval", type=int, default=300)
     pd = sub.add_parser("pending"); pd.add_argument("namespace")
     sub.add_parser("fingerprint")
+    sh = sub.add_parser("shadow", help="champion contre challenger (config shadow)"); sh.add_argument("namespace")
     b = sub.add_parser("bench", help="banc de preuve : invariants en volume, graines fixes")
     b.add_argument("--n", type=int, default=3000); b.add_argument("--seed", type=int, default=0)
     b.add_argument("--crash-rounds", type=int, default=20)
@@ -91,6 +93,10 @@ def main(argv=None) -> int:
         rules = eng.rules(a.namespace)
         if a.action == "lint":
             out = {"errors": rules.errors, "count": len(rules.rules)}
+        elif a.action == "simulate":
+            if not a.candidate:
+                ap.error("rules simulate attend --candidate FICHIER")
+            out = simulate_rules(eng, a.namespace, json.loads(Path(a.candidate).read_text()))
         else:
             cases_path = Path(a.cases) if a.cases else eng.ns_dir(a.namespace) / "rules.test.json"
             cases = json.loads(cases_path.read_text()) if cases_path.exists() else []
@@ -129,6 +135,8 @@ def main(argv=None) -> int:
         out = eng.prune(a.namespace, a.days)
     elif a.cmd == "fingerprint":
         out = fingerprint(eng)
+    elif a.cmd == "shadow":
+        out = shadow_report(eng, a.namespace)
     elif a.cmd == "bench":
         out = bench_run(a.n, a.seed, a.crash_rounds, eng, a.namespace, a.live)
         if not out["ok"]:

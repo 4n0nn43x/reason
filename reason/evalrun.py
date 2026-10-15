@@ -313,3 +313,103 @@ def _expected(dec: dict, o: dict | None) -> str | None:
     exp = hf.get("correct_action") or (dec["action"]["name"] if base_result(o) == "success" else None)
     return None if exp in META_ACTIONS else exp
 
+
+def simulate_rules(engine: Engine, ns: str, candidate: list[dict], examples: int = 20) -> dict:
+    """Rejoue des règles candidates sur les requêtes journalisées, sans appel modèle. Pour chaque décision : action
+    forcée par les nouvelles règles, action prise désormais interdite (escalade), ou règle forcée retirée (le modèle
+    serait consulté, issue inconnue). Sur les décisions réglées : erreurs évitées, erreurs introduites, escalades."""
+    from .core import validate
+    from .rules import Rules
+    if not isinstance(candidate, list):
+        raise ValueError("les règles candidates doivent être une liste JSON")
+    old, new = engine.rules(ns), Rules(candidate)
+    counts = {"decisions": 0, "changed": 0, "newly_forced": 0, "newly_blocked": 0, "released_to_model": 0,
+              "errors_avoided": 0, "errors_introduced": 0, "new_escalations_on_success": 0,
+              "escalations_automated_right": 0, "escalations_automated_wrong": 0}
+    ex = []
+    for rec, o in _settled(engine, ns):
+        req, dec = rec["request"], rec["decision"]
+        taken = dec["action"]["name"]
+        if dec["tier"] == "loop":                      # l'anti-boucle passe avant les règles : rien ne changerait
+            counts["decisions"] += 1
+            continue
+        forced, forb = new.decide(req), new.forbidden(req)
+        cand = {a["name"]: a for a in req["candidate_actions"]}
+        if forced and forced["name"] != "ask_human" and (     # ignorée par le moteur : abstain, non candidate,
+                forced["name"] not in cand or forced["name"] in forb   # interdite, ou paramètres hors schéma
+                or validate(forced.get("params", {}), cand[forced["name"]].get("schema", {"type": "object"}))):
+            forced = None
+        elif forced and forced["name"] in forb:
+            forced = None
+        if forced and forced["name"] != taken:
+            pred, kind = forced["name"], "newly_forced"
+        elif taken in forb and taken not in old.forbidden(req):
+            pred, kind = "ask_human", "newly_blocked"
+        elif dec["tier"] == "rules" and not forced:
+            pred, kind = None, "released_to_model"
+        else:
+            counts["decisions"] += 1
+            continue
+        counts["decisions"] += 1
+        counts["changed"] += 1
+        counts[kind] += 1
+        exp = _expected(dec, o)
+        settled = o is not None and base_result(o) != "unknown"
+        was_right = None if taken in META_ACTIONS or not settled else (taken == exp if exp else False)
+        now_right = None if pred in (None, "ask_human") else (pred == exp if exp else None)
+        if was_right is False and (pred == "ask_human" or now_right):
+            counts["errors_avoided"] += 1
+        elif was_right and now_right is False:
+            counts["errors_introduced"] += 1
+        elif was_right and pred == "ask_human":
+            counts["new_escalations_on_success"] += 1
+        elif was_right is None and now_right is not None:          # escalade d'hier tranchée par l'humain, automatisée demain
+            counts["escalations_automated_right" if now_right else "escalations_automated_wrong"] += 1
+        if len(ex) < examples:
+            ex.append({"decision_id": dec["decision_id"], "kind": kind, "taken": taken, "predicted": pred,
+                       "result": o.get("result") if o else None, "expected": exp})
+    return {"namespace": ns, "lint": new.errors, **counts, "examples": ex,
+            "note": "requêtes telles que journalisées (champs masqués par redact_paths compris) ; une action interdite "
+                    "est comptée comme escalade alors que le palier suivant pourrait conclure ; released_to_model : issue inconnue ; "
+                    "comparaison aux règles actuelles, les décisions passées ont pu suivre une version antérieure"}
+
+
+def shadow_report(engine: Engine, ns: str) -> dict:
+    """Champion contre challenger (mode ombre) sur les mêmes requêtes. Paires étiquetées : correction humaine, sinon
+    l'action du champion si elle a réussi, ce qui avantage le champion (une autre action aurait pu réussir aussi)."""
+    rows: dict[str, dict] = {}
+    for r in _rows(engine.ns_dir(ns) / "shadow.jsonl"):
+        rows[r["decision_id"]] = r
+    by_id = {rec["decision"]["decision_id"]: (rec, o) for rec, o in _settled(engine, ns)}
+    ok = [r for r in rows.values() if "challenger" in r]
+    out = {"namespace": ns, "shadowed": len(rows), "errors": len(rows) - len(ok),
+           "agreement": calib.mean([float(r["agree"]) for r in ok]),
+           "challenger_escalation_rate": calib.mean([float(r["challenger"]["action"] in META_ACTIONS) for r in ok]),
+           "champion_escalation_rate": calib.mean([float(r["champion"]["action"] in META_ACTIONS) for r in ok])}
+    wins = losses = both_right = both_wrong = auto_right = auto_wrong = esc_on_error = esc_on_right = 0
+    for r in ok:
+        rec, o = by_id.get(r["decision_id"], (None, None))
+        exp = _expected(rec["decision"], o) if rec else None
+        if exp is None:
+            continue
+        c, h = r["champion"]["action"], r["challenger"]["action"]
+        if h in META_ACTIONS:                      # le challenger escalade : erreur évitée ou automatisation perdue
+            esc_on_error += c not in META_ACTIONS and c != exp
+            esc_on_right += c == exp
+            continue
+        if c in META_ACTIONS:                      # le champion a escaladé, l'humain a tranché : le challenger aurait-il eu raison ?
+            auto_right += h == exp
+            auto_wrong += h != exp
+            continue
+        cr, hr = c == exp, h == exp
+        wins += hr and not cr
+        losses += cr and not hr
+        both_right += cr and hr
+        both_wrong += not (cr or hr)
+    out["paired"] = {"n": wins + losses + both_right + both_wrong, "challenger_wins": wins, "challenger_losses": losses,
+                     "both_right": both_right, "both_wrong": both_wrong, "p_sign": calib.sign_test(wins, losses)}
+    out["champion_escalations_challenger_would_automate"] = {"right": auto_right, "wrong": auto_wrong}
+    out["challenger_escalations"] = {"on_champion_errors": esc_on_error, "on_champion_successes": esc_on_right}
+    out["note"] = ("étiquette par défaut = action du champion quand elle a réussi : biais en faveur du champion ; seules "
+                   "les corrections humaines départagent sans biais ; quelques centaines de paires discordantes avant de conclure")
+    return out

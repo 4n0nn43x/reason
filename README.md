@@ -361,6 +361,16 @@ replays the regression set three times on the same cases (lessons on, off, delib
 
 Orders of magnitude to keep in mind: telling a 55 % hit rate from 50 % takes roughly 600 to 800 independent outcomes; 52 % from 50 %, about 4 000 to 6 600.
 
+**Shadow mode (champion / challenger).** With `"shadow": {"acme/*": {"decider": "challenger-model"}}` in the config, every model-made decision in a matching namespace is decided a second time by the challenger, as a dry run in a background thread: nothing is executed, the served decision does not wait for it, and the comparison goes to `shadow.jsonl`. Rule-made decisions and idempotent replays are not shadowed. The queue holds 1 000 comparisons (extra ones are dropped) and its threads do not keep a process alive, so shadow mode is meant for `reason serve`: a one-shot `reason decide` exits without waiting and loses its comparison. `python -m reason shadow acme/invoices` reports agreement, escalation rates, paired wins and losses on settled decisions with a sign test, and how the challenger would have done on the cases the champion escalated. Without a human correction, a success labels the champion's action as right, which favours the champion; only corrections compare both sides without bias.
+
+**Rule simulation on history.**
+
+```bash
+python -m reason rules acme/invoices simulate --candidate rules.new.json
+```
+
+replays candidate rules on every journaled request, without calling a model, and reports which decisions would change (action forced, action now forbidden, forced rule removed) and, on settled ones, the errors avoided, the errors introduced, the new escalations on decisions that had succeeded and the escalations that would now be automated. A forbidden action is counted as an escalation even though the next tier might conclude; requests are evaluated as journaled, with `redact_paths` fields masked, against the current `rules.json` (past decisions may have followed an older version).
+
 **Proof bench.**
 
 ```bash
@@ -395,7 +405,7 @@ reason/
   calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
   poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
-  __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench init
+  __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests
