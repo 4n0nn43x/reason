@@ -307,6 +307,9 @@ class TestExternalEstimates(unittest.TestCase):
         v = eng.record_estimate({"namespace": ns, "kind": "categorical", "estimator": "vault", "dist": [0.3, 0.7],
                                  "outcomes": ["Yes", "No"], "correlation_key": "0xA", "source": "opinion"})
         void = eng.record_estimate({"namespace": ns, "kind": "binary", "estimator": "static", "p": 0.5, "correlation_key": "0xB"})
+        old = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()   # marché long : au-delà de match_ttl_hours (720 h)
+        senate = eng.record_estimate({"namespace": ns, "kind": "categorical", "estimator": "vault", "dist": [0.2, 0.5, 0.3],
+                                      "outcomes": ["A", "B", "C"], "correlation_key": "0xC", "now": old})
         with self.assertRaises(ValueError):
             eng.record_estimate({"namespace": ns, "kind": "categorical", "estimator": "x", "dist": [0.9, 0.9], "outcomes": ["a", "b"]})
         with self.assertRaises(ValueError):
@@ -315,13 +318,15 @@ class TestExternalEstimates(unittest.TestCase):
         ts = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
         events.write_text(json.dumps({"type": "MARKET_RESOLVED", "market": "0xA", "winningOutcomeIdx": 0, "ts": ts}) + "\n"
                           + json.dumps({"type": "MARKET_CANCELLED", "market": "0xB", "ts": ts}) + "\n"
+                          + json.dumps({"type": "MARKET_RESOLVED", "market": "0xC", "winningOutcomeIdx": 1, "ts": ts}) + "\n"
                           + json.dumps({"type": "BUY", "market": "0xA"}) + "\n")
         src = {"name": "resolutions", "namespace": ns, "type": "jsonl", "path": str(events), "settles": "estimates",
                "fields": {"correlation_key": "market", "result": "type", "winning": "winningOutcomeIdx", "settled_at": "ts"},
                "result_map": {"MARKET_RESOLVED": "success", "MARKET_CANCELLED": "void"}, "ignore": ["BUY"]}
         r = poller.tick(eng, src, tmp / "state.json", now=datetime.now(timezone.utc) + timedelta(hours=1))
         self.assertEqual(r["errors"], [])
-        self.assertEqual({x["estimate_id"] for x in r["posted"]}, {a["estimate_id"], v["estimate_id"], void["estimate_id"]})
+        self.assertEqual({x["estimate_id"] for x in r["posted"]},
+                         {a["estimate_id"], v["estimate_id"], void["estimate_id"], senate["estimate_id"]})
         scores = {json.loads(l)["estimate_id"]: json.loads(l) for l in (tmp / "data" / ns / "estimate_scores.jsonl").read_text().splitlines()}
         self.assertEqual(scores[a["estimate_id"]]["outcome"], 1)                 # idx 0 = "Yes" = p_outcome
         self.assertAlmostEqual(scores[a["estimate_id"]]["brier_raw"], 0.04)
@@ -330,6 +335,9 @@ class TestExternalEstimates(unittest.TestCase):
         self.assertEqual(eng.pending_estimates(ns), [])
         rep = calibration_report(eng, ns)
         self.assertEqual(set(rep["sources"]), {"watcher:crypto-bands"})          # un canal par estimator, binaires résolus
+        self.assertEqual(rep["sources_multi"]["vault"]["n"], 2)                    # issues multiples, même canal
+        self.assertAlmostEqual(rep["sources_multi"]["vault"]["brier_multi"], ((0.49 + 0.49) + (0.04 + 0.25 + 0.09)) / 2)
+        self.assertIsNotNone(rep["sources_multi"]["vault"]["bss_vs_uniform"])
         web = FakeLLM("w", [{"p": 0.4, "interval_lo": None, "interval_hi": None, "dist": None, "q05": None, "q50": None, "q95": None,
                              "source": "opinion", "base_rate": None, "evidence": [], "rationale": "", "lessons_used": []}])
         web.web = True

@@ -1018,6 +1018,7 @@ class Engine:
                 idx = est["outcomes"].index(o["outcome_label"]) if o.get("outcome_label") in est["outcomes"] else int(o["outcome"])
                 d = est["raw"]["dist"]
                 row.update({"outcome": idx, "brier_multi": calib.brier_multi(d, idx),
+                            "brier_uniform": calib.brier_multi([1 / len(d)] * len(d), idx),
                             "rps": calib.rps(d, idx) if est["kind"] == "ordinal" else None})
                 helpful = row["brier_multi"] < calib.brier_multi([1 / len(d)] * len(d), idx)
             else:

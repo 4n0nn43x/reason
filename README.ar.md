@@ -277,6 +277,8 @@ curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN"
 
 مصدر poller مع `"settles": "estimates"` يحسم كل التقديرات المعلّقة لمفتاح `correlation_key` من حدث تسوية واحد: `fields.winning` هي النتيجة الفائزة (تسمية أو فهرس، أو القيمة في حالة `quantity`)، و`void` أو `no_outcome` يلغي. تسجيل حدث حسم واحد لكل سوق، سواء تم التداول فيه أم لا، يقيّم أيضاً التقديرات المرفوضة ويزيل انحياز الاختيار الناتج عن تقييم ما اشتُري فقط.
 
+في هذه المصادر لا يحدّ `match_ttl_hours` المطابقة: التقدير على سوق يُحسم بعد أشهر يُقيَّم مع ذلك. تظهر التقديرات متعددة النتائج (`categorical`، `ordinal`) لكل قناة تحت `sources_multi` في `calibrate`: Brier متعدد الفئات، والمهارة مقارنة بالتوزيع المنتظم، وRPS للنتائج المرتبة.
+
 ```bash
 curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
   -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,

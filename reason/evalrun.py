@@ -213,7 +213,20 @@ def calibration_report(engine: Engine, ns: str, bins: int = 5) -> dict:
         lessons[lid] = {"n_with": len(with_l), "brier_with": calib.mean(with_l), "brier_without": calib.mean(without),
                         "delta_observational": (calib.mean(without) - calib.mean(with_l)) if with_l and without else None,
                         "ci90_with": calib.bootstrap_ci(with_l)}
-    return {"namespace": ns, "resolved": len(rows), "brier_all": calib.mean(all_b), "sources": sources, "lessons": lessons,
+    # issues multiples (categorical, ordinal) : Brier multi-classe par canal, skill contre la distribution uniforme
+    multi = [r for r in _rows(engine.ns_dir(ns) / "estimate_scores.jsonl")
+             if r.get("status") == "resolved" and r.get("kind") in ("categorical", "ordinal")]
+    sources_multi = {}
+    for ch in {channel(r) for r in multi}:
+        rs = [r for r in multi if channel(r) == ch]
+        bm = [r["brier_multi"] for r in rs]
+        uni = [r["brier_uniform"] for r in rs if r.get("brier_uniform") is not None]
+        rps = [r["rps"] for r in rs if r.get("rps") is not None]
+        sources_multi[ch] = {"n": len(rs), "brier_multi": calib.mean(bm), "brier_ci90": calib.bootstrap_ci(bm),
+                             "bss_vs_uniform": calib.skill(calib.mean(bm), calib.mean(uni)) if len(uni) == len(rs) else None,
+                             "rps": calib.mean(rps) if rps else None}
+    return {"namespace": ns, "resolved": len(rows), "brier_all": calib.mean(all_b), "sources": sources,
+            "sources_multi": sources_multi, "lessons": lessons,
             "note": "delta_observational > 0 = la leçon accompagne de meilleures estimations ; biais de confusion possible, "
                     "le rejeu contrefactuel (calibrate --counterfactual) est la mesure causale"}
 

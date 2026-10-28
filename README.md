@@ -237,6 +237,8 @@ When the question settles, `POST /estimate/outcome` scores it: Brier and log-los
 
 A poller source with `"settles": "estimates"` settles every pending estimate of a `correlation_key` from one settlement event: `fields.winning` is the winning outcome (label or index, or the value for `quantity`), `void` or `no_outcome` annuls. Logging one resolution event per market, traded or not, scores the estimates you declined too, which removes the selection bias of scoring only what was bought.
 
+For these sources `match_ttl_hours` does not bound matching: an estimate on a market that settles months later is still scored. Multi-outcome estimates (`categorical`, `ordinal`) appear per channel under `sources_multi` in `calibrate`: multi-class Brier, skill against the uniform distribution, RPS for ordinal ones.
+
 ```bash
 curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
   -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,

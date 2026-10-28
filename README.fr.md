@@ -235,6 +235,8 @@ Quand la question est tranchée, `POST /estimate/outcome` la note : Brier et log
 
 Une source du poller avec `"settles": "estimates"` règle toutes les estimations en attente d'une `correlation_key` à partir d'un seul événement : `fields.winning` donne l'issue gagnante (label ou index, ou la valeur pour `quantity`), `void` ou `no_outcome` annule. Journaliser un événement de résolution par marché, tradé ou non, note aussi les estimations refusées et supprime le biais de sélection de ne scorer que ce qu'on a acheté.
 
+Pour ces sources, `match_ttl_hours` ne borne pas l'appariement : une estimation sur un marché réglé des mois plus tard est quand même notée. Les estimations à plusieurs issues (`categorical`, `ordinal`) apparaissent par canal sous `sources_multi` dans `calibrate` : Brier multi-classe, skill contre la distribution uniforme, RPS pour les issues ordonnées.
+
 ```bash
 curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
   -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,

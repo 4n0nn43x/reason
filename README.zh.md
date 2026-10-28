@@ -235,6 +235,8 @@ curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN"
 
 设置 `"settles": "estimates"` 的 poller 来源用一个结算事件结算某个 `correlation_key` 的全部待定估计：`fields.winning` 是胜出结果（标签或索引，`quantity` 时为数值），`void` 或 `no_outcome` 表示作废。为每个市场（无论是否交易）记录一条结算事件，也能为被放弃的估计打分，消除只评估已买入市场的选择偏差。
 
+对这类来源，`match_ttl_hours` 不限制匹配：数月后才结算的市场上的估计仍会被打分。多结果估计（`categorical`、`ordinal`）在 `calibrate` 中按渠道列于 `sources_multi`：多类 Brier、相对均匀分布的 skill，有序结果另给 RPS。
+
 ```bash
 curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
   -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,

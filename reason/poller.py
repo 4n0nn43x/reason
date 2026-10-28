@@ -11,7 +11,8 @@ Sources (config["poller"]["sources"][i]) :
    "ignore": ["BUY", "SELL"]}
 Avec "settles": "estimates", la source règle les estimations (POST /estimate/record ou /estimate avec correlation_key)
 au lieu des décisions : `fields.winning` donne l'issue gagnante (label ou index, ou la valeur pour kind=quantity), un
-résultat void ou no_outcome annule l'estimation. Chaque règlement résout toutes les estimations de la clé, tous canaux
+résultat void ou no_outcome annule l'estimation. match_ttl_hours ne borne pas l'appariement des estimations (marchés
+longs), seulement la durée pendant laquelle un événement sans estimation reste en attente. Chaque règlement résout toutes les estimations de la clé, tous canaux
 confondus, ce qui permet de scorer aussi les marchés non tradés.
 Un type d'événement qui n'est ni un résultat valide, ni dans `result_map`, ni dans `ignore` n'est JAMAIS converti en
 `unknown` (cela exclurait silencieusement des pertes du score, biais du survivant) : il est gardé de côté, compté dans le
@@ -127,14 +128,15 @@ def _newer(a, b) -> bool:
         return str(a) > str(b)
 
 
-def matches(decision: dict, outcome: dict, ttl_hours: float) -> bool:
+def matches(decision: dict, outcome: dict, ttl_hours: float | None) -> bool:
+    """ttl_hours=None : pas de borne haute (une estimation sur un marché long reste réglable quel que soit le délai)."""
     if decision.get("correlation_key") != outcome["correlation_key"]:
         return False
     settled = parse_instant(outcome.get("settled_at"))
     decided = parse_instant(decision.get("decided_at"))
     if settled is None or decided is None:
         return True
-    return decided <= settled <= decided + timedelta(hours=ttl_hours)
+    return decided <= settled and (ttl_hours is None or settled <= decided + timedelta(hours=ttl_hours))
 
 
 def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> dict:
@@ -182,7 +184,7 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
             new_wm = pos
     unmatched = []
     for o, seen in queue:
-        hits = [d for d in pending if matches(d, o, ttl)]
+        hits = [d for d in pending if matches(d, o, None if estimates else ttl)]
         for d in hits:
             if estimates:
                 try:
