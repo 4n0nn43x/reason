@@ -8,6 +8,10 @@ max_tokens_key ("max_tokens" ou "max_completion_tokens"), reasoning_effort, extr
 Avec provider="anthropic" : reasoning_effort devient output_config.effort, le schéma passe par output_config.format,
 temperature et max_tokens_key sont ignorés (l'API 2026-10-21 refuse les paramètres d'échantillonnage), et la réponse
 est lue en streaming SSE pour qu'une longue génération ne dépasse pas le timeout.
+web=True active la recherche en ligne native du fournisseur (outil web_search chez Anthropic, plugin web chez OpenRouter,
+web_search_options ailleurs) ; web_max_uses borne le nombre de recherches. Chez Anthropic les citations de la recherche
+excluent output_config.format : le schéma passe alors dans le prompt et la sortie est validée côté code. `extra` reste
+prioritaire pour tout réglage propre au fournisseur.
 """
 from __future__ import annotations
 
@@ -30,10 +34,12 @@ class LLM:
     def __init__(self, base_url: str, model: str, api_key: str | None = None, api_key_env: str | None = None,
                  json_schema: bool = True, reasoning_effort: str | None = None, timeout: int = 90,
                  extra: dict | None = None, max_tokens: int = 1024, max_tokens_key: str = "max_tokens",
-                 temperature: float | None = 0.0, name: str = "llm", provider: str = "openai"):
+                 temperature: float | None = 0.0, name: str = "llm", provider: str = "openai", web: bool = False,
+                 web_max_uses: int = 5):
         if provider not in ("openai", "anthropic"):
             raise ValueError(f"modèle {name}: provider inconnu {provider!r}")
         self.provider = provider
+        self.web, self.web_max_uses = web, web_max_uses
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key or (os.environ.get(api_key_env) if api_key_env else None)
@@ -49,7 +55,7 @@ class LLM:
     @classmethod
     def from_config(cls, name: str, cfg: dict) -> "LLM":
         known = {"base_url", "model", "api_key", "api_key_env", "json_schema", "reasoning_effort", "timeout", "extra",
-                 "max_tokens", "max_tokens_key", "temperature", "provider"}
+                 "max_tokens", "max_tokens_key", "temperature", "provider", "web", "web_max_uses"}
         unknown = set(cfg) - known
         if unknown:
             raise ValueError(f"modèle {name}: options inconnues {sorted(unknown)}")
@@ -67,6 +73,11 @@ class LLM:
             body["temperature"] = temp
         if self.reasoning_effort:
             body["reasoning_effort"] = self.reasoning_effort
+        if self.web:
+            if "openrouter.ai" in self.base_url:
+                body["plugins"] = [{"id": "web", "max_results": self.web_max_uses}]
+            else:
+                body["web_search_options"] = {}
         if schema is not None:
             if self.json_schema:
                 body["response_format"] = {"type": "json_schema", "json_schema": {
@@ -109,6 +120,8 @@ class LLM:
     def _chat_anthropic(self, messages: list[dict], schema: dict | None, max_tokens: int | None,
                         retries: int) -> tuple[dict | str, dict]:
         system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        if schema is not None and self.web:
+            system += "\n\nRéponds en terminant par un unique objet JSON valide respectant ce schéma JSON :\n" + json.dumps(schema)
         body: dict = {"model": self.model, "max_tokens": max_tokens or self.max_tokens,
                       "messages": [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]}
         if system:
@@ -116,8 +129,12 @@ class LLM:
         output_config: dict = {}
         if self.reasoning_effort:
             output_config["effort"] = self.reasoning_effort
-        if schema is not None:
+        if schema is not None and not self.web:
             output_config["format"] = {"type": "json_schema", "schema": schema}
+        if self.web:
+            # ponytail: recherche directe (sans filtrage dynamique) bornée par max_uses, pour rester loin de la limite
+            # d'itérations serveur ; pause_turn devient une erreur. `extra` peut fournir un autre outil.
+            body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": self.web_max_uses}]
         if output_config:
             body["output_config"] = output_config
         body["stream"] = True   # le timeout s'applique alors à chaque lecture, pas à toute la génération
@@ -131,7 +148,14 @@ class LLM:
                     raise LLMError("réponse tronquée (stop_reason=max_tokens), augmenter max_tokens")
                 if stop == "refusal":
                     raise LLMError(f"refus du modèle : {raw.get('stop_details')}")
-                content = "".join(b.get("text", "") for b in raw.get("content", []) if b.get("type") == "text")
+                if stop == "pause_turn":
+                    raise LLMError("recherche web interrompue (pause_turn), baisser web_max_uses")
+                content = ""
+                for b in raw.get("content", []):       # seul le texte après la dernière recherche est la réponse
+                    if b.get("type") == "text":
+                        content += b.get("text", "")
+                    elif b.get("type") != "thinking":
+                        content = ""
                 usage = raw.get("usage") or {}
                 if schema is None:
                     return content, usage

@@ -182,6 +182,7 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 
 - A single model that both decides and executes: `examples/reason.config.executor-only.json`.
 - **Claude** natively: `{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`. `reasoning_effort` maps to `output_config.effort` (`low` to `max`), the decision schema goes through structured outputs, `temperature` is never sent, and responses are streamed so a long generation does not hit `timeout` (it applies per read). Any role can use it.
+- `"web": true` turns on the provider's native web search (`web_max_uses`, default 5, caps the searches): the `web_search` tool on Claude, the `web` plugin on OpenRouter, `web_search_options` on other OpenAI-compatible APIs (search models only; others reject it). On Claude, search citations exclude enforced JSON, so the schema goes into the prompt and the output is validated locally. Estimates made by such a model land in their own channel, `web:<model>`, so their Brier is measured apart and you keep them only if they beat the market. Page content is untrusted input, and a replay (`calibrate --counterfactual`, `eval`) can find the answer online once the question has settled: keep web models out of replays.
 - **Jev** (TypeSafe AI) is optional, never loaded unless a model declares `"provider": "jev"`. It is a typed-decision model, not an LLM: calibrated choice in well under a second, directly or through OpenRouter (`base_url` `https://openrouter.ai/api`). It returns no parameters and no explanation, so actions that require parameters escalate to the reasoner.
 - `json_schema: false` for providers without strict structured outputs (DeepSeek): Reason falls back to `json_object` and validates locally.
 - `temperature: null` and `max_tokens_key: "max_completion_tokens"` for OpenAI reasoning models; `extra` passes any provider-specific field verbatim.
@@ -231,6 +232,23 @@ curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN"
 `kind` is `binary` (p and a 90 % interval), `categorical` or `ordinal` (a distribution that must sum to 1), or `quantity` (q05, q50, q95). Every estimate carries `source` (`fact` read from a dated primary source, `model` from a reproducible calculation, `opinion` otherwise), `evidence[]`, an optional `base_rate`, the lessons it used, and both `raw` and `calibrated` values. With `n_samples > 1` the samples are averaged in log-odds space and their spread becomes the interval.
 
 When the question settles, `POST /estimate/outcome` scores it: Brier and log-loss (raw and calibrated), Brier of the base rate and of the market price as references, RPS for ordinal outcomes, absolute error and interval coverage for quantities. Lessons used by the estimate are credited from the score.
+
+**External estimates.** Probabilities produced elsewhere (a watcher, a vault thesis, a static model) are recorded with `POST /estimate/record` (MCP `record_estimate`, CLI `estimate-record`), without any model call, under a free `estimator` channel. Calibration, Platt fits and `calibrate` reports are grouped per `estimator` (falling back to `source`), so the question "is `watcher:crypto-bands` calibrated?" gets its own Brier. Only the first estimate per (`namespace`, `estimator`, `correlation_key`) is kept: a watcher that republishes every minute keeps its first snapshot. A binary estimate names the outcome its `p` is about in `p_outcome`.
+
+A poller source with `"settles": "estimates"` settles every pending estimate of a `correlation_key` from one settlement event: `fields.winning` is the winning outcome (label or index, or the value for `quantity`), `void` or `no_outcome` annuls. Logging one resolution event per market, traded or not, scores the estimates you declined too, which removes the selection bias of scoring only what was bought.
+
+```bash
+curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,
+       "p_outcome": "Yes", "outcomes": ["Yes", "No"], "correlation_key": "0xmarket", "market_price": 0.55}'
+```
+
+```json
+{"name": "resolutions", "namespace": "trader/polymarket", "type": "jsonl", "path": "/var/trader/events.jsonl",
+ "settles": "estimates", "ignore": ["BUY", "SELL", "FILL"],
+ "fields": {"correlation_key": "market", "result": "type", "winning": "winningOutcomeIdx", "settled_at": "ts"},
+ "result_map": {"MARKET_RESOLVED": "success", "MARKET_CANCELLED": "void"}}
+```
 
 ```bash
 python -m reason calibrate trader/delphi            # per source: Brier, skill vs base rate and market, Murphy decomposition
@@ -410,7 +428,7 @@ reason/
   calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
   poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
-  __main__.py    CLI: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests

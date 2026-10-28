@@ -180,6 +180,7 @@ La réponse porte toujours `tier` (`rules`, `decider`, `reasoner`, `loop`, `esca
 
 - Un seul modèle qui décide et exécute : `examples/reason.config.executor-only.json`.
 - **Claude** en natif : `{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`. `reasoning_effort` devient `output_config.effort` (`low` à `max`), le schéma de décision passe par les sorties structurées, `temperature` n'est jamais envoyé, et la réponse est lue en streaming pour qu'une longue génération ne dépasse pas `timeout` (il s'applique à chaque lecture). Utilisable pour n'importe quel rôle.
+- `"web": true` active la recherche en ligne native du fournisseur (`web_max_uses`, 5 par défaut, borne le nombre de recherches) : l'outil `web_search` chez Claude, le plugin `web` chez OpenRouter, `web_search_options` sur les autres API compatibles OpenAI (modèles de recherche uniquement, les autres le refusent). Chez Claude, les citations de la recherche excluent le JSON imposé : le schéma passe dans le prompt et la sortie est validée localement. Les estimations d'un tel modèle tombent dans leur propre canal, `web:<modèle>`, pour que leur Brier soit mesuré à part : on ne les garde que si elles battent le marché. Le contenu des pages est une entrée non fiable, et un rejeu (`calibrate --counterfactual`, `eval`) peut trouver la réponse en ligne une fois la question tranchée : gardez les modèles web hors des rejeux.
 - **Jev** (TypeSafe AI) est optionnel, jamais chargé tant qu'aucun modèle ne déclare `"provider": "jev"`. C'est un modèle de décision typée, pas un LLM : choix calibré en bien moins d'une seconde, directement ou via OpenRouter (`base_url` `https://openrouter.ai/api`). Il ne renvoie ni paramètres ni explication, donc les actions qui exigent des paramètres sont escaladées au raisonneur.
 - `json_schema: false` pour les fournisseurs sans sorties structurées strictes (DeepSeek) : Reason passe en `json_object` et valide localement.
 - `temperature: null` et `max_tokens_key: "max_completion_tokens"` pour les modèles de raisonnement OpenAI ; `extra` transmet tel quel tout champ propre au fournisseur.
@@ -229,6 +230,23 @@ curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN"
 `kind` vaut `binary` (p et un intervalle à 90 %), `categorical` ou `ordinal` (une distribution qui doit sommer à 1), ou `quantity` (q05, q50, q95). Chaque estimation porte `source` (`fact` lu dans une source primaire datée, `model` issu d'un calcul reproductible, `opinion` sinon), `evidence[]`, un `base_rate` optionnel, les leçons utilisées, et les valeurs `raw` et `calibrated`. Avec `n_samples > 1`, les échantillons sont moyennés en log-odds et leur dispersion devient l'intervalle.
 
 Quand la question est tranchée, `POST /estimate/outcome` la note : Brier et log-loss (brut et calibré), Brier du taux de base et du prix de marché comme références, RPS pour les issues ordonnées, erreur absolue et couverture d'intervalle pour les quantités. Les leçons utilisées sont créditées à partir du score.
+
+**Estimations externes.** Les probabilités produites ailleurs (un watcher, une thèse du vault, un modèle statique) s'enregistrent avec `POST /estimate/record` (MCP `record_estimate`, CLI `estimate-record`), sans appel modèle, sous un canal libre `estimator`. La calibration, les ajustements Platt et les rapports `calibrate` sont groupés par `estimator` (à défaut par `source`) : la question « `watcher:crypto-bands` est-il calibré ? » obtient son propre Brier. Seule la première estimation par (`namespace`, `estimator`, `correlation_key`) est gardée : un watcher qui republie chaque minute garde son premier instantané. Une estimation binaire nomme dans `p_outcome` l'issue dont `p` est la probabilité.
+
+Une source du poller avec `"settles": "estimates"` règle toutes les estimations en attente d'une `correlation_key` à partir d'un seul événement : `fields.winning` donne l'issue gagnante (label ou index, ou la valeur pour `quantity`), `void` ou `no_outcome` annule. Journaliser un événement de résolution par marché, tradé ou non, note aussi les estimations refusées et supprime le biais de sélection de ne scorer que ce qu'on a acheté.
+
+```bash
+curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,
+       "p_outcome": "Yes", "outcomes": ["Yes", "No"], "correlation_key": "0xmarket", "market_price": 0.55}'
+```
+
+```json
+{"name": "resolutions", "namespace": "trader/polymarket", "type": "jsonl", "path": "/var/trader/events.jsonl",
+ "settles": "estimates", "ignore": ["BUY", "SELL", "FILL"],
+ "fields": {"correlation_key": "market", "result": "type", "winning": "winningOutcomeIdx", "settled_at": "ts"},
+ "result_map": {"MARKET_RESOLVED": "success", "MARKET_CANCELLED": "void"}}
+```
 
 ```bash
 python -m reason calibrate trader/delphi            # par source : Brier, skill contre taux de base et marché, décomposition de Murphy
@@ -408,7 +426,7 @@ reason/
   calib.py       Brier, log-loss, RPS, décomposition de Murphy, Platt, Wilson, bootstrap (stdlib)
   poller.py      issues différées : sources JSONL / HTTP / GraphQL, watermark, appariement, horizon
   vault.py       vault markdown : leçons en frontmatter, propositions, post-mortems (ne réécrit jamais un fichier existant)
-  __main__.py    CLI : serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
 tests/test_reason.py         60 tests hors ligne

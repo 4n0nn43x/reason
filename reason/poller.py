@@ -9,6 +9,10 @@ Sources (config["poller"]["sources"][i]) :
               "settled_at": "...", "ref": "...", "resolution_text": "...", "label_confidence": 0.9},
    "result_map": {"win": "success", "loss": "failure", "refund": "void", "no_outcome": "no_outcome"},
    "ignore": ["BUY", "SELL"]}
+Avec "settles": "estimates", la source règle les estimations (POST /estimate/record ou /estimate avec correlation_key)
+au lieu des décisions : `fields.winning` donne l'issue gagnante (label ou index, ou la valeur pour kind=quantity), un
+résultat void ou no_outcome annule l'estimation. Chaque règlement résout toutes les estimations de la clé, tous canaux
+confondus, ce qui permet de scorer aussi les marchés non tradés.
 Un type d'événement qui n'est ni un résultat valide, ni dans `result_map`, ni dans `ignore` n'est JAMAIS converti en
 `unknown` (cela exclurait silencieusement des pertes du score, biais du survivant) : il est gardé de côté, compté dans le
 rapport du tick (`unmapped`), signalé sur stderr, et retraité à chaque tick avec la configuration courante.
@@ -107,7 +111,8 @@ def normalize(src: dict, item: dict, position) -> dict | None:
            "result_detail": detail, "value": _val(item, f.get("value")), "payout_fraction": _val(item, f.get("payout_fraction")),
            "settled_at": settled, "observed_at": datetime.now(timezone.utc).isoformat(),
            "source": src["name"], "source_ref": str(ref), "label_confidence": _val(item, f.get("label_confidence", 1.0)),
-           "resolution_text": _val(item, f.get("resolution_text")), "version": _val(item, f.get("version"))}
+           "resolution_text": _val(item, f.get("resolution_text")), "version": _val(item, f.get("version")),
+           "winning": _val(item, f.get("winning"))}
     return {k: v for k, v in out.items() if v is not None}
 
 
@@ -138,7 +143,8 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
     ns = src["namespace"]
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     st = state.setdefault(src["name"], {"watermark": None, "last_run": None})
-    pending = engine.pending(ns)
+    estimates = src.get("settles", "decisions") == "estimates"
+    pending = engine.pending_estimates(ns) if estimates else engine.pending(ns)
     posted, skipped, errors = [], [], []
     unmapped: dict[str, int] = {}
     if src["type"] == "jsonl":
@@ -178,6 +184,14 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
     for o, seen in queue:
         hits = [d for d in pending if matches(d, o, ttl)]
         for d in hits:
+            if estimates:
+                try:
+                    r = engine.settle_estimate(d["estimate_id"], o)
+                    posted.append({"estimate_id": d["estimate_id"], "source_ref": o["source_ref"], "recorded": r.get("recorded"),
+                                   "duplicate": r.get("duplicate", False)})
+                except (ValueError, KeyError) as e:
+                    errors.append(f"{d['estimate_id']}: {e}")
+                continue
             try:
                 r = engine.outcome({**{k: v for k, v in o.items() if v is not None}, "decision_id": d["decision_id"]})
                 posted.append({"decision_id": d["decision_id"], "source_ref": o["source_ref"], "recorded": r.get("recorded"), "duplicate": r.get("duplicate", False)})
@@ -189,7 +203,7 @@ def tick(engine, src: dict, state_path: Path, now: datetime | None = None) -> di
     st["unmatched"] = unmatched[-MAX_UNMATCHED:]
     horizon = src.get("horizon_hours")
     expired = []
-    if horizon:
+    if horizon and not estimates:
         for d in engine.pending(ns):
             decided = parse_instant(d.get("decided_at"))
             if not d.get("expired") and decided and (now - decided).total_seconds() / 3600 > horizon:

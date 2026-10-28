@@ -856,7 +856,10 @@ class Engine:
                     "evidence": samples[0].get("evidence", []), "rationale": samples[0].get("rationale", ""),
                     "lessons_used": [l for l in samples[0].get("lessons_used", []) if l in shown], "lessons_shown": shown,
                     "n_samples": len(samples), "n_requested": n, "model": getattr(llm, "model", None), "market_price": x.get("market_price"),
-                    "resolves_at": x.get("resolves_at"), "status": "ok"})
+                    "resolves_at": x.get("resolves_at"),
+                    # une estimation faite avec recherche en ligne a son propre canal : elle se calibre à part
+                    "estimator": x.get("estimator") or (f"web:{llm.name}" if getattr(llm, "web", False) else None),
+                    "correlation_key": x.get("correlation_key"), "p_outcome": x.get("p_outcome"), "status": "ok"})
         est["calibrated"] = self._calibrate(ns, est)
         if dry_run:
             return est
@@ -868,6 +871,57 @@ class Engine:
         with self._lock:
             self._journaled.add(est["estimate_id"])
         return est
+
+    def record_estimate(self, x: dict) -> dict:
+        """Estimation venue d'ailleurs (watcher, vault, statique) : enregistrée et scorée comme les autres, sans appel modèle.
+        Une seule estimation par (namespace, estimator, correlation_key) : un renvoi rend la première (instantané figé)."""
+        errs = validate(x, ESTIMATE_RECORD_SCHEMA)
+        if errs:
+            raise ValueError("estimate/record invalide: " + "; ".join(errs))
+        kind, outcomes, ns = x["kind"], x.get("outcomes") or [], x["namespace"]
+        if kind in ("categorical", "ordinal") and len(outcomes) < 2:
+            raise ValueError("outcomes (≥ 2) requis pour categorical/ordinal")
+        try:
+            est = self._aggregate(kind, outcomes, [x])
+        except LLMError as e:
+            raise ValueError(str(e).replace("estimateur: ", "")) from None
+        self.ns_dir(ns)
+        self.refresh()
+        est.update({"estimate_id": _eid(), "namespace": ns, "kind": kind, "outcomes": outcomes, "now": x.get("now") or utcnow_iso(),
+                    "source": x.get("source") or "model", "estimator": x["estimator"], "base_rate": x.get("base_rate"),
+                    "market_price": x.get("market_price"), "correlation_key": x.get("correlation_key"),
+                    "p_outcome": x.get("p_outcome"), "evidence": x.get("evidence", []), "rationale": x.get("rationale", ""),
+                    "lessons_used": [], "lessons_shown": [], "n_samples": 1, "model": None,
+                    "resolves_at": x.get("resolves_at"), "external": True, "status": "ok"})
+        est["calibrated"] = self._calibrate(ns, est)
+        # ponytail: déduplication par processus ; deux serveurs sur le même data_dir peuvent doubler un instantané
+        with self._lock:
+            if est["correlation_key"] is not None:
+                for rec in self._estimates.values():
+                    e = rec["estimate"]
+                    if (e.get("namespace"), e.get("estimator"), e.get("correlation_key")) == (ns, est["estimator"], est["correlation_key"]):
+                        return {**e, "duplicate": True}
+            self._estimates[est["estimate_id"]] = {"request": x, "estimate": est}
+        self._journal(ns, {"type": "EstimateMade", "request": x, "estimate": est})
+        with self._lock:
+            self._journaled.add(est["estimate_id"])
+        return est
+
+    def pending_estimates(self, ns: str) -> list[dict]:
+        """Estimations non résolues qui portent une correlation_key (réglables par le poller)."""
+        self.refresh()
+        with self._lock:
+            return [{"estimate_id": e["estimate_id"], "correlation_key": e["correlation_key"], "decided_at": e.get("now")}
+                    for rec in self._estimates.values() for e in [rec["estimate"]]
+                    if e.get("namespace") == ns and e.get("correlation_key") is not None
+                    and e["estimate_id"] not in self._estimate_done]
+
+    def settle_estimate(self, estimate_id: str, settlement: dict) -> dict:
+        """Résout une estimation à partir d'un règlement normalisé par le poller."""
+        rec = self._estimates.get(estimate_id)
+        if not rec:
+            raise KeyError(f"estimation inconnue: {estimate_id}")
+        return self.estimate_outcome(resolve_from_settlement(rec["estimate"], settlement))
 
     @staticmethod
     def _aggregate(kind: str, outcomes: list, samples: list[dict]) -> dict:
@@ -914,7 +968,7 @@ class Engine:
     def _calibrate(self, ns: str, est: dict) -> dict:
         if est["kind"] != "binary":
             return {"p": None, "method": "none"}
-        fit = self.calibration(ns).get(est["source"]) or {}
+        fit = self.calibration(ns).get(channel(est)) or {}
         p = est["raw"]["p"]
         if fit.get("method") == "platt":
             return {"p": round(calib.platt_apply(p, fit["a"], fit["b"]), 4), "method": "platt", "fitted_on": fit.get("fitted_on")}
@@ -944,6 +998,7 @@ class Engine:
                 return {"estimate_id": est["estimate_id"], "recorded": False, "duplicate": True}
             self._estimate_done.add(est["estimate_id"])
         row = {"estimate_id": est["estimate_id"], "namespace": ns, "kind": est["kind"], "source": est["source"],
+               "estimator": est.get("estimator"), "correlation_key": est.get("correlation_key"),
                "model": est.get("model"), "status": status, "resolved_at": o.get("resolved_at") or utcnow_iso(),
                "lessons_used": est["lessons_used"], "created_now": est.get("now")}
         helpful = None
@@ -1015,6 +1070,41 @@ def intent_key(ns: str, decision_id: str, action: str, params: dict) -> str:
     return "ik_" + hashlib.sha256(canon.encode()).hexdigest()[:32]
 
 
+def channel(est: dict) -> str:
+    """Canal de calibration : l'estimator déclaré (watcher:crypto-bands, vault, static...), sinon la source fact/model/opinion."""
+    return est.get("estimator") or est["source"]
+
+
+def resolve_from_settlement(est: dict, settlement: dict) -> dict:
+    """Payload estimate_outcome déduit d'un règlement du poller (`winning` = issue gagnante, label ou index ; valeur pour
+    kind=quantity). Un binaire porte p_outcome, l'issue dont p est la probabilité ; sans lui, winning doit valoir 0 ou 1."""
+    o = {"estimate_id": est["estimate_id"], "resolution_source": f"{settlement.get('source')}:{settlement.get('source_ref')}",
+         "resolved_at": None if settlement.get("settled_at") is None else str(settlement["settled_at"])}
+    if settlement.get("result") in ("void", "no_outcome"):
+        return {**o, "status": "annulled"}
+    w = settlement.get("winning")
+    if w is None:
+        raise ValueError("règlement sans issue gagnante (fields.winning)")
+    outcomes = est.get("outcomes") or []
+
+    def label(v):
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < len(outcomes):
+            return outcomes[v]
+        if isinstance(v, str) and v.isdigit() and str(v) not in outcomes and int(v) < len(outcomes):
+            return outcomes[int(v)]
+        return str(v)
+    if est["kind"] == "binary":
+        target = est.get("p_outcome")
+        if target is not None:
+            return {**o, "outcome": int(label(w) == label(target))}
+        if w in (0, 1) or w in ("0", "1"):
+            return {**o, "outcome": int(w)}
+        raise ValueError("estimation binaire sans p_outcome et issue gagnante non binaire")
+    if est["kind"] in ("categorical", "ordinal"):
+        return {**o, "outcome_label": label(w)}
+    return {**o, "value": float(w)}
+
+
 def _eid() -> str:
     return "e_" + hashlib.sha1(str(time.time_ns()).encode()).hexdigest()[:12]
 
@@ -1067,7 +1157,25 @@ ESTIMATE_SCHEMA = {"type": "object", "required": ["namespace", "question", "kind
                                   "decision_point": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}},
                                   "models": {"type": "object"}, "n_samples": {"type": "integer", "minimum": 1, "maximum": 10},
                                   "exclude_lessons": {"type": "array", "items": {"type": "string"}},
-                                  "ruling_text": {"type": ["string", "null"]}, "state": {}, "event": {}}}
+                                  "ruling_text": {"type": ["string", "null"]}, "state": {}, "event": {},
+                                  "estimator": {"type": ["string", "null"]}, "correlation_key": {"type": ["string", "null"]},
+                                  "p_outcome": {"type": ["string", "integer", "null"]}}}
+_NUM = {"type": ["number", "null"]}
+ESTIMATE_RECORD_SCHEMA = {"type": "object", "required": ["namespace", "kind", "estimator"],
+                          "properties": {"namespace": {"type": "string"}, "estimator": {"type": "string"},
+                                         "kind": {"type": "string", "enum": ["binary", "categorical", "ordinal", "quantity"]},
+                                         "p": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                                         "interval_lo": _NUM, "interval_hi": _NUM,
+                                         "dist": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 1}},
+                                         "q05": _NUM, "q50": _NUM, "q95": _NUM,
+                                         "outcomes": {"type": "array", "items": {"type": "string"}},
+                                         "p_outcome": {"type": ["string", "integer", "null"]},
+                                         "question": {"type": "string"}, "correlation_key": {"type": ["string", "null"]},
+                                         "market_price": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                                         "base_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                                         "resolves_at": {"type": ["string", "null"]}, "now": {"type": ["string", "number", "null"]},
+                                         "source": {"type": "string", "enum": ["fact", "model", "opinion"]},
+                                         "evidence": {"type": "array"}, "rationale": {"type": "string"}}}
 ESTIMATE_OUTCOME_SCHEMA = {"type": "object", "required": ["estimate_id"],
                            "properties": {"estimate_id": {"type": "string"}, "outcome": {"type": ["integer", "null"], "minimum": 0},
                                           "outcome_label": {"type": ["string", "null"]}, "value": {"type": ["number", "null"]},

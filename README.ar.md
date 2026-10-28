@@ -210,6 +210,7 @@ python -m reason lessons acme/invoices approve L-003
 
 - نموذج واحد يقرّر وينفّذ معاً: `examples/reason.config.executor-only.json`.
 - **Claude** مباشرةً: `{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`. يتحوّل `reasoning_effort` إلى `output_config.effort` (من `low` إلى `max`)، ويمرّ مخطط القرار عبر المخرجات المهيكلة، ولا يُرسَل `temperature` أبداً، وتُقرأ الاستجابة بالبث كي لا يتجاوز التوليد الطويل `timeout` (يُطبَّق على كل قراءة). يصلح لأي دور.
+- `"web": true` يفعّل البحث الأصلي على الويب لدى المزوّد (`web_max_uses`، الافتراضي 5، يحدّ عدد عمليات البحث): أداة `web_search` لدى Claude، وإضافة `web` لدى OpenRouter، و`web_search_options` على واجهات OpenAI المتوافقة الأخرى (نماذج البحث فقط، والبقية ترفضه). لدى Claude تتعارض استشهادات البحث مع فرض JSON، فيُوضع المخطط في الموجّه ويُتحقَّق من المخرجات محلياً. تقديرات هذا النموذج تذهب إلى قناتها الخاصة `web:<النموذج>` ليُقاس Brier الخاص بها على حدة، ولا تُعتمد إلا إذا تفوّقت على السوق. محتوى الصفحات مدخل غير موثوق، وإعادة التشغيل (`calibrate --counterfactual`، `eval`) قد تجد الجواب على الإنترنت بعد حسم المسألة: أبقِ نماذج الويب خارج إعادة التشغيل.
 - **Jev** (TypeSafe AI) اختياري، ولا يُحمَّل إلا إذا أعلن نموذج `"provider": "jev"`. وهو نموذج قرار مُنمَّط وليس نموذج لغة: اختيار معاير في أقل من ثانية بكثير، مباشرة أو عبر OpenRouter (`base_url` هو `https://openrouter.ai/api`). لا يعيد معاملات ولا تفسيراً، لذا تُصعَّد الإجراءات التي تتطلب معاملات إلى المُستدِل.
 - `json_schema: false` للمزوّدين الذين لا يدعمون المخرجات المهيكلة الصارمة (DeepSeek): يرجع Reason إلى `json_object` ويتحقّق محلياً.
 - `temperature: null` و`max_tokens_key: "max_completion_tokens"` لنماذج الاستدلال من OpenAI؛ و`extra` يمرّر أي حقل خاص بالمزوّد كما هو.
@@ -271,6 +272,23 @@ curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN"
 قيمة `kind` هي `binary` (p ومجال 90 %)، أو `categorical` أو `ordinal` (توزيع يجب أن يكون مجموعه 1)، أو `quantity` (q05، q50، q95). يحمل كل تقدير `source` (`fact` مقروء من مصدر أولي مؤرَّخ، `model` من حساب قابل للإعادة، وإلا `opinion`)، و`evidence[]`، و`base_rate` اختيارياً، والدروس المستخدمة، والقيمتين `raw` و`calibrated`. مع `n_samples > 1` تُحسب العينات كمتوسط في فضاء اللوغاريتم-الأرجحية ويصبح تشتّتها هو المجال.
 
 حين تُحسم المسألة، يقيّمها `POST /estimate/outcome`: Brier وlog-loss (خام ومعاير)، وBrier للمعدل الأساسي ولسعر السوق كمرجعين، وRPS للنتائج المرتبة، والخطأ المطلق وتغطية المجال للكميات. تُنسب للدروس المستخدمة نقاط بحسب النتيجة.
+
+**التقديرات الخارجية.** الاحتمالات المنتَجة في مكان آخر (watcher، أو أطروحة في الـ vault، أو نموذج ثابت) تُسجَّل عبر `POST /estimate/record` (MCP `record_estimate`، CLI `estimate-record`) دون أي استدعاء لنموذج، تحت قناة حرة `estimator`. تُجمَّع المعايرة وملاءمات Platt وتقارير `calibrate` حسب `estimator` (وإلا حسب `source`)، فيحصل سؤال «هل `watcher:crypto-bands` معاير؟» على Brier خاص به. لا يُحتفَظ إلا بأول تقدير لكل (`namespace`، `estimator`، `correlation_key`): الـ watcher الذي يعيد النشر كل دقيقة يحتفظ بلقطته الأولى. التقدير الثنائي يسمّي في `p_outcome` النتيجة التي يمثّل `p` احتمالها.
+
+مصدر poller مع `"settles": "estimates"` يحسم كل التقديرات المعلّقة لمفتاح `correlation_key` من حدث تسوية واحد: `fields.winning` هي النتيجة الفائزة (تسمية أو فهرس، أو القيمة في حالة `quantity`)، و`void` أو `no_outcome` يلغي. تسجيل حدث حسم واحد لكل سوق، سواء تم التداول فيه أم لا، يقيّم أيضاً التقديرات المرفوضة ويزيل انحياز الاختيار الناتج عن تقييم ما اشتُري فقط.
+
+```bash
+curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,
+       "p_outcome": "Yes", "outcomes": ["Yes", "No"], "correlation_key": "0xmarket", "market_price": 0.55}'
+```
+
+```json
+{"name": "resolutions", "namespace": "trader/polymarket", "type": "jsonl", "path": "/var/trader/events.jsonl",
+ "settles": "estimates", "ignore": ["BUY", "SELL", "FILL"],
+ "fields": {"correlation_key": "market", "result": "type", "winning": "winningOutcomeIdx", "settled_at": "ts"},
+ "result_map": {"MARKET_RESOLVED": "success", "MARKET_CANCELLED": "void"}}
+```
 
 </div>
 
@@ -500,7 +518,7 @@ reason/
   calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
   poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
   vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
-  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
 tests/test_reason.py         60 اختباراً دون شبكة

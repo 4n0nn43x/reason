@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import calib
-from .core import META_ACTIONS, Engine, base_result
+from .core import META_ACTIONS, Engine, base_result, channel
 from .llm import LLMError
 from .rules import parse_instant
 
@@ -188,7 +188,7 @@ def calibration_report(engine: Engine, ns: str, bins: int = 5) -> dict:
     rows = [r for r in _rows(engine.ns_dir(ns) / "estimate_scores.jsonl") if r.get("status") == "resolved" and r.get("kind") == "binary"]
     by_source: dict[str, list[dict]] = {}
     for r in rows:
-        by_source.setdefault(r["source"], []).append(r)
+        by_source.setdefault(channel(r), []).append(r)
     sources = {}
     for src, rs in by_source.items():
         ps, os_ = [r["p_raw"] for r in rs], [r["outcome"] for r in rs]
@@ -225,8 +225,8 @@ def fit_calibration(engine: Engine, ns: str, min_n: int = 30) -> dict:
     rows.sort(key=lambda r: parse_instant(r.get("created_now")) or epoch0)
     current = engine.calibration(ns)
     report = {}
-    for src in {r["source"] for r in rows}:
-        rs = [r for r in rows if r["source"] == src]
+    for src in {channel(r) for r in rows}:
+        rs = [r for r in rows if channel(r) == src]
         fit = calib.fit_if_better([r["p_raw"] for r in rs], [r["outcome"] for r in rs], min_n=min_n)
         report[src] = fit or {"method": "none", "reason": f"moins de {min_n} issues"}
         if fit and fit["method"] == "platt":

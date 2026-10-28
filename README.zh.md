@@ -180,6 +180,7 @@ python -m reason lessons acme/invoices approve L-003
 
 - 单个模型既决策又执行：`examples/reason.config.executor-only.json`。
 - **Claude** 原生接入：`{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`。`reasoning_effort` 映射为 `output_config.effort`（`low` 到 `max`），决策 schema 走结构化输出，从不发送 `temperature`，响应以流式读取，长生成不会超过 `timeout`（按每次读取计算）。任何角色都可使用。
+- `"web": true` 启用供应商原生的联网搜索（`web_max_uses` 默认 5，限制搜索次数）：Claude 上为 `web_search` 工具，OpenRouter 上为 `web` 插件，其他兼容 OpenAI 的 API 上为 `web_search_options`（仅限搜索模型，其他模型会拒绝）。在 Claude 上，搜索引用与强制 JSON 输出互斥，因此 schema 写入提示词，输出在本地校验。此类模型的估计归入独立渠道 `web:<模型>`，单独计算 Brier，只有跑赢市场才保留。网页内容属于不可信输入；问题揭晓后，回放（`calibrate --counterfactual`、`eval`）可能在网上直接找到答案：不要让联网模型参与回放。
 - **Jev**（TypeSafe AI）是可选的：只有当某个模型声明 `"provider": "jev"` 时才会加载。它是类型化决策模型，不是 LLM：远低于一秒给出校准过的选择，可直连或经 OpenRouter（`base_url` 为 `https://openrouter.ai/api`）。它不返回参数也不解释，因此需要参数的动作会升级到推理器。
 - 对没有严格结构化输出的供应商（DeepSeek）设 `json_schema: false`：Reason 退回 `json_object` 并在本地校验。
 - OpenAI 推理模型用 `temperature: null` 与 `max_tokens_key: "max_completion_tokens"`；`extra` 原样透传任何供应商专有字段。
@@ -229,6 +230,23 @@ curl -s -X POST localhost:8787/estimate -H "Authorization: Bearer $REASON_TOKEN"
 `kind` 可为 `binary`（p 与 90 % 区间）、`categorical` 或 `ordinal`（总和必须为 1 的分布）、`quantity`（q05、q50、q95）。每个估计都带有 `source`（`fact` 取自带日期的一手来源，`model` 来自可复现的计算，否则为 `opinion`）、`evidence[]`、可选的 `base_rate`、所用经验，以及 `raw` 与 `calibrated` 两组值。当 `n_samples > 1` 时，样本在对数几率空间平均，其离散度成为区间。
 
 问题揭晓后，`POST /estimate/outcome` 为其打分：Brier 与 log-loss（原始与校准），以基准率和市场价格的 Brier 作为参照，有序结果用 RPS，数量用绝对误差和区间覆盖。估计所用的经验会依据分数获得记分。
+
+**外部估计。** 在别处产生的概率（watcher、vault 中的论点、静态模型）通过 `POST /estimate/record`（MCP `record_estimate`，CLI `estimate-record`）记录，不调用任何模型，归入自由命名的 `estimator` 渠道。校准、Platt 拟合与 `calibrate` 报告按 `estimator` 分组（缺省时按 `source`），因此「`watcher:crypto-bands` 是否校准？」有自己的 Brier。每个（`namespace`、`estimator`、`correlation_key`）只保留第一个估计：每分钟重发的 watcher 只保留首个快照。二元估计在 `p_outcome` 中注明 `p` 所对应的结果。
+
+设置 `"settles": "estimates"` 的 poller 来源用一个结算事件结算某个 `correlation_key` 的全部待定估计：`fields.winning` 是胜出结果（标签或索引，`quantity` 时为数值），`void` 或 `no_outcome` 表示作废。为每个市场（无论是否交易）记录一条结算事件，也能为被放弃的估计打分，消除只评估已买入市场的选择偏差。
+
+```bash
+curl -s -X POST localhost:8787/estimate/record -H "Authorization: Bearer $REASON_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"namespace": "trader/polymarket", "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.62,
+       "p_outcome": "Yes", "outcomes": ["Yes", "No"], "correlation_key": "0xmarket", "market_price": 0.55}'
+```
+
+```json
+{"name": "resolutions", "namespace": "trader/polymarket", "type": "jsonl", "path": "/var/trader/events.jsonl",
+ "settles": "estimates", "ignore": ["BUY", "SELL", "FILL"],
+ "fields": {"correlation_key": "market", "result": "type", "winning": "winningOutcomeIdx", "settled_at": "ts"},
+ "result_map": {"MARKET_RESOLVED": "success", "MARKET_CANCELLED": "void"}}
+```
 
 ```bash
 python -m reason calibrate trader/delphi            # 按来源：Brier、相对基准率与市场的技能分、Murphy 分解
@@ -408,7 +426,7 @@ reason/
   calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
   poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
   vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
-  __main__.py    CLI：serve decide outcome execute estimate estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
 tests/test_reason.py         60 个离线测试

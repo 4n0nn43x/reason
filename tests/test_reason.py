@@ -250,6 +250,29 @@ class TestAnthropic(unittest.TestCase):
             m.chat([{"role": "user", "content": "U"}])
 
 
+    def test_web_option_per_provider(self):
+        from reason.llm import LLM
+        c = LLM.from_config("cw", {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "model": "claude-opus-5-5",
+                                   "web": True, "web_max_uses": 3})
+        sent = []
+        c._post = lambda body, path="": (sent.append(body) or {"stop_reason": "end_turn", "content": [
+            {"type": "text", "text": "Je cherche {d'abord}."}, {"type": "server_tool_use", "name": "web_search"},
+            {"type": "web_search_tool_result", "content": []}, {"type": "text", "text": 'Résultat : {"p": 0.3}'}]})
+        out, _ = c.chat([{"role": "system", "content": "S"}, {"role": "user", "content": "U"}], schema={"type": "object"})
+        self.assertEqual(out, {"p": 0.3})                          # le texte d'avant la recherche est ignoré
+        self.assertEqual(sent[0]["tools"], [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}])
+        self.assertNotIn("output_config", sent[0])                 # citations et output_config.format s'excluent
+        self.assertIn('"type": "object"', sent[0]["system"])
+        c._post = lambda body, path="": {"stop_reason": "pause_turn", "content": []}
+        with self.assertRaises(LLMError):
+            c.chat([{"role": "user", "content": "U"}])
+        for url, key in (("https://openrouter.ai/api/v1", "plugins"), ("https://api.openai.com/v1", "web_search_options")):
+            o = LLM.from_config("ow", {"base_url": url, "model": "m", "web": True})
+            got = []
+            o._post = lambda body, path="/chat/completions": (got.append(body) or {"choices": [{"message": {"content": "ok"}}]})
+            o.chat([{"role": "user", "content": "U"}])
+            self.assertIn(key, got[0])
+
     def test_sse_stream_is_reassembled(self):
         from reason.llm import _read_sse, _Retryable
         ev = lambda d: b"data: " + json.dumps(d).encode() + b"\n"
@@ -266,6 +289,52 @@ class TestAnthropic(unittest.TestCase):
             _read_sse(stream[:-1])
         with self.assertRaises(_Retryable):
             _read_sse([ev({"type": "error", "error": {"type": "overloaded_error"}})])
+
+
+class TestExternalEstimates(unittest.TestCase):
+    def test_record_dedupe_poller_settlement_and_channel_calibration(self):
+        from datetime import datetime, timedelta, timezone
+        from reason import poller
+        from reason.evalrun import calibration_report
+        tmp = Path(tempfile.mkdtemp())
+        eng = engine(str(tmp / "data"))                          # aucun modèle : l'enregistrement n'en demande pas
+        ns = "trader/polymarket"
+        a = eng.record_estimate({"namespace": ns, "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.8,
+                                 "p_outcome": "Yes", "outcomes": ["Yes", "No"], "correlation_key": "0xA", "market_price": 0.6})
+        again = eng.record_estimate({"namespace": ns, "kind": "binary", "estimator": "watcher:crypto-bands", "p": 0.1,
+                                     "p_outcome": "Yes", "outcomes": ["Yes", "No"], "correlation_key": "0xA"})
+        self.assertTrue(again["duplicate"]); self.assertEqual(again["estimate_id"], a["estimate_id"])   # instantané figé
+        v = eng.record_estimate({"namespace": ns, "kind": "categorical", "estimator": "vault", "dist": [0.3, 0.7],
+                                 "outcomes": ["Yes", "No"], "correlation_key": "0xA", "source": "opinion"})
+        void = eng.record_estimate({"namespace": ns, "kind": "binary", "estimator": "static", "p": 0.5, "correlation_key": "0xB"})
+        with self.assertRaises(ValueError):
+            eng.record_estimate({"namespace": ns, "kind": "categorical", "estimator": "x", "dist": [0.9, 0.9], "outcomes": ["a", "b"]})
+        with self.assertRaises(ValueError):
+            eng.record_estimate({"namespace": ns, "kind": "binary", "estimator": "x", "p": 1.5})
+        events = tmp / "events.jsonl"
+        ts = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        events.write_text(json.dumps({"type": "MARKET_RESOLVED", "market": "0xA", "winningOutcomeIdx": 0, "ts": ts}) + "\n"
+                          + json.dumps({"type": "MARKET_CANCELLED", "market": "0xB", "ts": ts}) + "\n"
+                          + json.dumps({"type": "BUY", "market": "0xA"}) + "\n")
+        src = {"name": "resolutions", "namespace": ns, "type": "jsonl", "path": str(events), "settles": "estimates",
+               "fields": {"correlation_key": "market", "result": "type", "winning": "winningOutcomeIdx", "settled_at": "ts"},
+               "result_map": {"MARKET_RESOLVED": "success", "MARKET_CANCELLED": "void"}, "ignore": ["BUY"]}
+        r = poller.tick(eng, src, tmp / "state.json", now=datetime.now(timezone.utc) + timedelta(hours=1))
+        self.assertEqual(r["errors"], [])
+        self.assertEqual({x["estimate_id"] for x in r["posted"]}, {a["estimate_id"], v["estimate_id"], void["estimate_id"]})
+        scores = {json.loads(l)["estimate_id"]: json.loads(l) for l in (tmp / "data" / ns / "estimate_scores.jsonl").read_text().splitlines()}
+        self.assertEqual(scores[a["estimate_id"]]["outcome"], 1)                 # idx 0 = "Yes" = p_outcome
+        self.assertAlmostEqual(scores[a["estimate_id"]]["brier_raw"], 0.04)
+        self.assertEqual(scores[v["estimate_id"]]["outcome"], 0)
+        self.assertEqual(scores[void["estimate_id"]]["status"], "annulled")
+        self.assertEqual(eng.pending_estimates(ns), [])
+        rep = calibration_report(eng, ns)
+        self.assertEqual(set(rep["sources"]), {"watcher:crypto-bands"})          # un canal par estimator, binaires résolus
+        web = FakeLLM("w", [{"p": 0.4, "interval_lo": None, "interval_hi": None, "dist": None, "q05": None, "q50": None, "q95": None,
+                             "source": "opinion", "base_rate": None, "evidence": [], "rationale": "", "lessons_used": []}])
+        web.web = True
+        eng.models["w"] = web; eng.roles["estimator"] = "w"
+        self.assertEqual(eng.estimate({"namespace": ns, "question": "q", "kind": "binary"})["estimator"], "web:w")
 
 
 class TestJev(unittest.TestCase):
@@ -357,12 +426,12 @@ class TestServer(unittest.TestCase):
         self.assertEqual(r["result"]["serverInfo"]["name"], "reason")
         self.assertEqual(self.call("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0], 202)
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual([t["name"] for t in r["result"]["tools"]], ["decide", "outcome", "execute", "estimate", "estimate_outcome"])
+        self.assertEqual([t["name"] for t in r["result"]["tools"]], ["decide", "outcome", "execute", "estimate", "record_estimate", "estimate_outcome"])
         hints = {t["name"]: (t["annotations"]["readOnlyHint"], t["annotations"]["destructiveHint"],
                              t["annotations"]["idempotentHint"], t["annotations"]["openWorldHint"]) for t in r["result"]["tools"]}
         self.assertEqual(hints, {"decide": (False, False, False, True), "outcome": (False, True, True, True),
                                  "execute": (False, False, False, True), "estimate": (False, False, False, True),
-                                 "estimate_outcome": (False, True, True, False)})
+                                 "record_estimate": (False, False, True, False), "estimate_outcome": (False, True, True, False)})
         self.assertTrue(all(t["title"] == t["annotations"]["title"] for t in r["result"]["tools"]))
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                             "params": {"name": "decide", "arguments": req(run_id="mcp-1")}})
@@ -392,7 +461,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual((st, r["result"]["supportedVersions"], r["result"]["resultType"]), (200, ["2026-07-28"], "complete"))
         self.assertEqual(r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "reason")
         st, r = mcp("tools/list")
-        self.assertEqual((st, r["result"]["ttlMs"], r["result"]["cacheScope"], len(r["result"]["tools"])), (200, 0, "public", 5))
+        self.assertEqual((st, r["result"]["ttlMs"], r["result"]["cacheScope"], len(r["result"]["tools"])), (200, 0, "public", 6))
         st, r = mcp("tools/call", {"name": "decide", "arguments": req(run_id="mcp-2026")},
                     headers={"Mcp-Name": "=?base64?ZGVjaWRl?="})                    # « decide » encodé en base64
         self.assertEqual((st, r["result"]["isError"], r["result"]["resultType"]), (200, False, "complete"))
@@ -406,7 +475,7 @@ class TestServer(unittest.TestCase):
         st, r = mcp("ping")
         self.assertEqual((st, r["error"]["code"]), (404, -32601))
         st, r = self.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 9, "method": "tools/list"})   # client 2025-11-25 inchangé
-        self.assertEqual((st, len(r["result"]["tools"]), "_meta" in r["result"]), (200, 5, False))
+        self.assertEqual((st, len(r["result"]["tools"]), "_meta" in r["result"]), (200, 6, False))
 
     def test_claude_hook_human_answer_defer_updated_input(self):
         self.dec.answers[:0] = [typed("allow", conf=0.1, params={}) for _ in range(3)] + [typed("allow", params={})]

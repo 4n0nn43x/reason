@@ -43,6 +43,7 @@ def main(argv=None) -> int:
     x = sub.add_parser("execute"); x.add_argument("task")
     es = sub.add_parser("estimate"); es.add_argument("request")
     eo = sub.add_parser("estimate-outcome"); eo.add_argument("outcome")
+    er = sub.add_parser("estimate-record", help="enregistre une estimation externe (sans appel modèle)"); er.add_argument("request")
     l = sub.add_parser("lessons"); l.add_argument("namespace")
     l.add_argument("action", choices=["list", "pending", "approve", "reject", "add", "review"])
     l.add_argument("value", nargs="?")
@@ -87,6 +88,8 @@ def main(argv=None) -> int:
         out = eng.execute(_read(a.task))
     elif a.cmd == "estimate":
         out = eng.estimate(_read(a.request))
+    elif a.cmd == "estimate-record":
+        out = eng.record_estimate(_read(a.request))
     elif a.cmd == "estimate-outcome":
         out = eng.estimate_outcome(_read(a.outcome))
     elif a.cmd == "rules":

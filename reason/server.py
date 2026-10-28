@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import __version__
-from .core import ESTIMATE_OUTCOME_SCHEMA, ESTIMATE_SCHEMA, EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine, InProgress
+from .core import ESTIMATE_OUTCOME_SCHEMA, ESTIMATE_RECORD_SCHEMA, ESTIMATE_SCHEMA, EXECUTE_SCHEMA, OUTCOME_SCHEMA, REQUEST_SCHEMA, Engine, InProgress
 from .llm import LLMError
 
 MAX_BODY = 1_000_000
@@ -52,13 +52,18 @@ MCP_TOOLS = [
           EXECUTE_SCHEMA, destructive=False, idempotent=False, open_world=True),
     _tool("estimate", "Estimer une probabilité", "Estimation probabiliste calibrée (binaire, catégorielle, ordinale, quantité) avec source et preuves.",
           ESTIMATE_SCHEMA, destructive=False, idempotent=False, open_world=True),
+    # record_estimate : aucun appel modèle ; un renvoi pour le même (estimator, correlation_key) rend la première estimation
+    _tool("record_estimate", "Enregistrer une estimation externe",
+          "Enregistre une probabilité produite ailleurs (watcher, vault, statique) sous un canal `estimator`, pour la scorer et la calibrer par canal.",
+          ESTIMATE_RECORD_SCHEMA, destructive=False, idempotent=True, open_world=False),
     # estimate_outcome : aucun appel modèle ; une seconde résolution est un doublon sans effet
     _tool("estimate_outcome", "Résoudre une estimation", "Résout une estimation (issue réelle) pour la scorer (Brier, log-loss) et créditer les leçons.",
           ESTIMATE_OUTCOME_SCHEMA, destructive=True, idempotent=True, open_world=False),
 ]
 META_VERSION = "io.modelcontextprotocol/protocolVersion"
 MODERN_VERSIONS = ("2026-07-28",)          # versions sans initialize ; les clients 2025-11-25 passent par initialize
-SCOPE = {"decide": "decide", "outcome": "outcome", "execute": "execute", "estimate": "estimate", "estimate_outcome": "estimate"}
+SCOPE = {"decide": "decide", "outcome": "outcome", "execute": "execute", "estimate": "estimate", "estimate_outcome": "estimate",
+         "record_estimate": "estimate"}
 
 
 class Forbidden(Exception):
@@ -141,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
             raise Forbidden("namespace non accordé à ce jeton")
 
     def _ns_of(self, kind: str, body: dict) -> str | None:
-        if kind in ("decide", "execute", "estimate"):
+        if kind in ("decide", "execute", "estimate", "record_estimate"):
             return body.get("namespace") if isinstance(body.get("namespace"), str) else None
         if kind == "outcome":
             self.engine.refresh()
@@ -201,7 +206,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             route = {"/decide": "decide", "/outcome": "outcome", "/execute": "execute", "/estimate": "estimate",
-                     "/estimate/outcome": "estimate_outcome", "/estimate_outcome": "estimate_outcome"}.get(self.path)
+                     "/estimate/outcome": "estimate_outcome", "/estimate_outcome": "estimate_outcome",
+                     "/estimate/record": "record_estimate"}.get(self.path)
             if route:
                 self._check(SCOPE[route], self._ns_of(route, body))
                 return self._json(200, getattr(self.engine, route)(body))
