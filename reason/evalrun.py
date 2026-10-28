@@ -182,6 +182,56 @@ def outcome_summary(engine: Engine, ns: str, horizon_hours: float | None = None,
             "poller_lag_s_median": latencies[len(latencies) // 2] if latencies else None}
 
 
+def value_report(engine: Engine, ns: str, days: float | None = None, now: datetime | None = None) -> dict:
+    """Coût et valeur des décisions : par palier et par point de décision, dépense (USD, tokens), issues, et `value`
+    rapportée par l'issue (moyenne, IC 90 %, somme) ; par leçon, valeur moyenne avec et sans (observationnel).
+    La valeur sert à mesurer, jamais à pondérer le crédit des leçons : un gain extrême et chanceux l'emporterait."""
+    now = now or datetime.now(timezone.utc)
+    engine.refresh()
+    with engine._lock:
+        items = list(engine._by_id.items())
+        outcomes = dict(engine._outcomes)
+    rows = []
+    for did, rec in items:
+        req, dec = rec["request"], rec["decision"]
+        if req.get("namespace") != ns:
+            continue
+        when = datetime.fromtimestamp(rec["ts"], tz=timezone.utc)
+        if days is not None and (now - when).total_seconds() > days * 86400:
+            continue
+        o = outcomes.get(did) or {}
+        cost = dec.get("cost") or {}
+        rows.append({"tier": dec["tier"], "point": req["decision_point"], "day": when.date().isoformat(),
+                     "usd": cost.get("usd"), "tokens": cost.get("tokens_in", 0) + cost.get("tokens_out", 0),
+                     "result": base_result(o) if o else None, "value": o.get("value"), "unit": o.get("value_unit"),
+                     "lessons": dec.get("lessons_used") or []})
+
+    def summary(rs: list[dict]) -> dict:
+        usd = [r["usd"] for r in rs if r["usd"] is not None]
+        vals = [float(r["value"]) for r in rs if isinstance(r["value"], (int, float))]
+        known = [r for r in rs if r["result"] in ("success", "failure")]
+        return {"decisions": len(rs), "usd": round(sum(usd), 6) if usd else None,
+                "usd_per_decision": round(sum(usd) / len(usd), 6) if usd else None,
+                "tokens": sum(r["tokens"] for r in rs), "settled": len(known),
+                "success_rate": sum(r["result"] == "success" for r in known) / len(known) if known else None,
+                "value_n": len(vals), "value_mean": calib.mean(vals), "value_ci90": calib.bootstrap_ci(vals),
+                "value_sum": sum(vals) if vals else None}
+
+    def by(key: str) -> dict:
+        return {k: summary([r for r in rows if r[key] == k]) for k in sorted({r[key] for r in rows})}
+    lessons = {}
+    for lid in sorted({l for r in rows for l in r["lessons"]}):
+        w = [float(r["value"]) for r in rows if lid in r["lessons"] and isinstance(r["value"], (int, float))]
+        wo = [float(r["value"]) for r in rows if lid not in r["lessons"] and isinstance(r["value"], (int, float))]
+        lessons[lid] = {"n_with": len(w), "value_with": calib.mean(w), "value_without": calib.mean(wo)}
+    units = sorted({r["unit"] for r in rows if r["unit"]})
+    return {"namespace": ns, "days": days, "total": summary(rows), "by_tier": by("tier"), "by_decision_point": by("point"),
+            "by_day": by("day"), "lessons": lessons, "value_units": units,
+            "budget": {"today": engine._spend.get((ns, now.date().isoformat())), "exhausted": engine.over_budget(ns)},
+            "note": ("plusieurs unités de valeur mélangées : moyennes non comparables" if len(units) > 1 else
+                     "value_with/value_without : observationnel, pas causal")}
+
+
 def calibration_report(engine: Engine, ns: str, bins: int = 5) -> dict:
     """Par source : N, Brier brut et calibré, skill contre base et marché, Murphy (≥ 2 points par bin), couverture.
     Par leçon : Brier observationnel avec et sans la leçon (même namespace)."""

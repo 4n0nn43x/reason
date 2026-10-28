@@ -186,6 +186,7 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 - **Jev** (TypeSafe AI) is optional, never loaded unless a model declares `"provider": "jev"`. It is a typed-decision model, not an LLM: calibrated choice in well under a second, directly or through OpenRouter (`base_url` `https://openrouter.ai/api`). It returns no parameters and no explanation, so actions that require parameters escalate to the reasoner.
 - `json_schema: false` for providers without strict structured outputs (DeepSeek): Reason falls back to `json_object` and validates locally.
 - `temperature: null` and `max_tokens_key: "max_completion_tokens"` for OpenAI reasoning models; `extra` passes any provider-specific field verbatim.
+- `price_in` / `price_out` (USD per million input / output tokens) put a cost on every model call; see [Cost, budget and degraded mode](#cost-budget-and-degraded-mode).
 
 ## Rules (P0)
 
@@ -202,6 +203,17 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 ```
 
 `decide` short-circuits the models (0 ms, $0) when the action is a valid candidate. `forbid` vetoes the models' output: the action falls through to the next tier, then to the human. Operators: `eq ne gt gte lt lte in nin contains exists regex`. Prose policy read by the models lives in `policy.md`.
+
+Two rules worth having in trading: no buy without a news check younger than 7 days (a missing date blocks too, since `within_hours` is false and `not` makes it true), and no order above the cash still available. The caller computes `cash_available` (cash minus pending orders) and sends it in `state`; sizing and budgets across several orders stay in your code, Reason only vetoes.
+
+```json
+[
+  {"id": "news-fresh", "if": {"not": {"path": "state.facts.news_checked_at", "op": "within_hours", "value": 168}},
+   "forbid": ["buy"], "reason": "no news check in the last 7 days"},
+  {"id": "cash", "if": [{"path": "state.facts.order_amount", "op": "gt", "path2": "state.facts.cash_available"}],
+   "forbid": ["buy"], "reason": "order above available cash"}
+]
+```
 
 ## Scored estimates, deferred outcomes, rules and lessons
 
@@ -317,6 +329,36 @@ Pre-match odds go stale at kick-off.
 
 Files in `doctrine/` are approved, files in `postmortems/` are pending, unless `status:` says otherwise. Lessons without provenance are quarantined, duplicate ids are ignored and reported, expired lessons drop out on their own. Approving in Obsidian (edit `status:` or move the file) takes effect at the next decision. Reason writes new proposals as new files and **never modifies an existing vault file**; counters stay in Reason's own data.
 
+## Cost, budget and degraded mode
+
+Every decision that called a model carries `cost`: `tokens_in`, `tokens_out`, `usd` (when the models declare `price_in` and `price_out`) and `by_tier`. Rule decisions cost nothing and carry no `cost`.
+
+```json
+{
+  "models": {"reasoner": {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY",
+                          "model": "claude-opus-5-5", "reasoning_effort": "high", "price_in": 4, "price_out": 20}},
+  "budgets": {"trader/*": {"usd_per_day": 5}},
+  "fallback": {"trader/*": "hold"}
+}
+```
+
+- **Daily budget** per namespace (UTC day, `usd_per_day` and/or `tokens_per_day`): once reached, no model is called; the decision goes to the fallback, else to the human, with `budget_exhausted: true`. Spend is rebuilt from the journal, so it holds across restarts and processes. It covers `/decide`, not `/estimate`, `/execute` or shadow runs.
+- **Fallback**: when no model answered (provider down, credit exhausted, budget reached), Reason returns the declared action (`fallback` per namespace glob, or `constraints.on_model_failure` per request) with `tier: "fallback"` and `degraded: true`. The action must be a candidate (or `abstain`), not forbidden by a rule, and valid without parameters; otherwise it is the human. Rules still apply first: "rules only, no buy" is a forced or forbidden rule plus `"fallback": "hold"`. A model that answered with low confidence is a normal escalation, not a fallback. Alerting is the caller's job: watch `degraded`.
+- **Cost and value**: `python -m reason value <ns> [--days 30]` reports, per tier, decision point, day and lesson, the spend (USD, tokens, USD per decision), settled outcomes, success rate and the `value` sent with outcomes (mean, 90 % CI, sum). Send the value you care about, for instance the excess return over the benchmark net of fees, with a `value_unit`. Value is measured, never used to weight lesson credit: one lucky extreme trade would dominate it.
+
+### Python client
+
+`reason.client.Client` (stdlib): timeout, retries, safe fallback.
+
+```python
+from reason.client import Client
+rc = Client("http://127.0.0.1:8787", token=os.environ["REASON_TOKEN"], timeout=30, retries=2)
+dec = rc.decide(request, fallback="hold")
+rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.012, "value_unit": "excess_return"})
+```
+
+Retries happen on a refused connection for every route, and on timeout, 409 or 5xx only for idempotent routes. `decide` becomes idempotent: an `idempotency_key` is generated when missing, so a resend returns the same decision. `/estimate` and `/execute` (billed model calls) are never resent after a timeout. With `fallback`, an unreachable service yields `tier: "client_fallback"`, `degraded: true`; a 4xx (invalid request, refused token) is always raised.
+
 ## Three facades, one engine
 
 ```mermaid
@@ -420,6 +462,7 @@ runs the invariants at volume, with fixed seeds and no network, in about ten sec
 reason/
   llm.py         OpenAI-compatible and Anthropic Messages client (urllib), strict or json_object output, retries
   jev.py         Jev (TypeSafe) adapter, same chat() interface
+  client.py      Python client: timeout, retries, safe fallback
   lessons.py     per-namespace playbook: counters, dedup, pruning, pending queue
   reflector.py   failure → lesson proposals
   bench.py       proof bench: rules, injection, providers, concurrency, crash, isolation, baselines
@@ -430,7 +473,7 @@ reason/
   calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
   poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
-  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests

@@ -214,6 +214,7 @@ python -m reason lessons acme/invoices approve L-003
 - **Jev** (TypeSafe AI) اختياري، ولا يُحمَّل إلا إذا أعلن نموذج `"provider": "jev"`. وهو نموذج قرار مُنمَّط وليس نموذج لغة: اختيار معاير في أقل من ثانية بكثير، مباشرة أو عبر OpenRouter (`base_url` هو `https://openrouter.ai/api`). لا يعيد معاملات ولا تفسيراً، لذا تُصعَّد الإجراءات التي تتطلب معاملات إلى المُستدِل.
 - `json_schema: false` للمزوّدين الذين لا يدعمون المخرجات المهيكلة الصارمة (DeepSeek): يرجع Reason إلى `json_object` ويتحقّق محلياً.
 - `temperature: null` و`max_tokens_key: "max_completion_tokens"` لنماذج الاستدلال من OpenAI؛ و`extra` يمرّر أي حقل خاص بالمزوّد كما هو.
+- `price_in` / `price_out` (بالدولار لكل مليون رمز إدخال / إخراج) تحدّد كلفة كل استدعاء للنموذج؛ انظر قسم «الكلفة والميزانية والوضع المتدهور».
 
 ## القواعد (P0)
 
@@ -234,6 +235,17 @@ python -m reason lessons acme/invoices approve L-003
 <div dir="rtl">
 
 يتجاوز `decide` النماذج (0 ميلي ثانية، 0 دولار) حين يكون الإجراء مرشّحاً صالحاً. ينقض `forbid` مخرجات النماذج: ينتقل الإجراء إلى الطبقة التالية ثم إلى الإنسان. المعاملات: `eq ne gt gte lt lte in nin contains exists regex`. السياسة النثرية التي تقرؤها النماذج تُوضع في `policy.md`.
+
+قاعدتان مفيدتان في التداول: لا شراء دون مراجعة للأخبار عمرها أقل من 7 أيام (غياب التاريخ يمنع أيضاً: `within_hours` خاطئ و`not` يجعله صحيحاً)، ولا أمر يتجاوز النقد المتاح. يحسب المستدعي `cash_available` (النقد ناقص الأوامر المعلّقة) ويرسله في `state`؛ تحديد الأحجام وتوزيع الميزانية على عدة أوامر يبقيان في شيفرتك، وReason يكتفي بالنقض.
+
+```json
+[
+  {"id": "news-fresh", "if": {"not": {"path": "state.facts.news_checked_at", "op": "within_hours", "value": 168}},
+   "forbid": ["buy"], "reason": "لم تُراجَع الأخبار منذ 7 أيام"},
+  {"id": "cash", "if": [{"path": "state.facts.order_amount", "op": "gt", "path2": "state.facts.cash_available"}],
+   "forbid": ["buy"], "reason": "أمر يتجاوز النقد المتاح"}
+]
+```
 
 ## تقديرات مُقيَّمة ونتائج مؤجلة وقواعد ودروس
 
@@ -381,6 +393,36 @@ author: human
 
 ملفات `doctrine/` معتمدة، وملفات `postmortems/` قيد الانتظار، ما لم يقل `status:` غير ذلك. تُعزل الدروس التي بلا مصدر، وتُتجاهل المعرّفات المكررة ويُبلَّغ عنها، وتخرج الدروس المنتهية تلقائياً. الموافقة في Obsidian (تعديل `status:` أو نقل الملف) تسري عند القرار التالي. يكتب Reason المقترحات الجديدة كملفات جديدة و**لا يعدّل أبداً أي ملف موجود في المستودع**؛ تبقى العدّادات في بيانات Reason نفسها.
 
+## الكلفة والميزانية والوضع المتدهور
+
+كل قرار استدعى نموذجاً يحمل `cost`: `tokens_in` و`tokens_out` و`usd` (إذا أعلنت النماذج `price_in` و`price_out`) و`by_tier`. القرار الصادر عن قاعدة لا يكلّف شيئاً ولا يحمل `cost`.
+
+```json
+{
+  "models": {"reasoner": {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY",
+                          "model": "claude-opus-5-5", "reasoning_effort": "high", "price_in": 4, "price_out": 20}},
+  "budgets": {"trader/*": {"usd_per_day": 5}},
+  "fallback": {"trader/*": "hold"}
+}
+```
+
+- **ميزانية يومية** لكل namespace (يوم UTC، `usd_per_day` و/أو `tokens_per_day`): عند بلوغها لا يُستدعى أي نموذج، ويذهب القرار إلى الإجراء الاحتياطي وإلا إلى الإنسان، مع `budget_exhausted: true`. يُعاد بناء الإنفاق من السجل، فيصمد عبر إعادة التشغيل والعمليات. تغطي `/decide` فقط، لا `/estimate` ولا `/execute` ولا وضع الظل.
+- **الإجراء الاحتياطي**: حين لا يجيب أي نموذج (عطل المزوّد، نفاد الرصيد، بلوغ الميزانية) يعيد Reason الإجراء المعلن (`fallback` حسب نمط الـ namespace، أو `constraints.on_model_failure` لكل طلب) مع `tier: "fallback"` و`degraded: true`. يجب أن يكون الإجراء مرشّحاً (أو `abstain`)، غير ممنوع بقاعدة، وصالحاً دون معاملات؛ وإلا فالإنسان. القواعد تُطبَّق دائماً أولاً: «القواعد وحدها، لا شراء» تُكتب بقاعدة فرض أو منع مع `"fallback": "hold"`. النموذج الذي أجاب بثقة منخفضة يؤدي إلى تصعيد عادي لا إلى الإجراء الاحتياطي. التنبيه مسؤولية المستدعي: راقب `degraded`.
+- **الكلفة والقيمة**: `python -m reason value <ns> [--days 30]` يعرض لكل طبقة ونقطة قرار ويوم ودرس: الإنفاق (دولار، رموز، دولار لكل قرار)، والنتائج المحسومة، ونسبة النجاح، و`value` المرسلة مع النتائج (المتوسط، مجال ثقة 90 %، المجموع). أرسل القيمة التي تهمّك، مثل العائد الزائد على المؤشر المرجعي بعد الرسوم، مع `value_unit`. القيمة تُقاس ولا تُستخدم أبداً لترجيح رصيد الدروس: صفقة متطرفة محظوظة واحدة كانت ستطغى عليه.
+
+### عميل Python
+
+`reason.client.Client` (المكتبة القياسية): مهلة، وإعادة محاولة، وإجراء احتياطي آمن.
+
+```python
+from reason.client import Client
+rc = Client("http://127.0.0.1:8787", token=os.environ["REASON_TOKEN"], timeout=30, retries=2)
+dec = rc.decide(request, fallback="hold")
+rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.012, "value_unit": "excess_return"})
+```
+
+تُعاد المحاولة عند رفض الاتصال لكل المسارات، وعند تجاوز المهلة أو 409 أو 5xx للمسارات المتساوية القوة فقط. يصبح `decide` متساوي القوة: يُولَّد `idempotency_key` إن غاب، فيعيد الإرسال القرار نفسه. لا يُعاد إرسال `/estimate` و`/execute` (استدعاءات نموذج مدفوعة) بعد تجاوز المهلة أبداً. مع `fallback` تعطي خدمة غير متاحة `tier: "client_fallback"` و`degraded: true`؛ أما 4xx (طلب غير صالح، رمز مرفوض) فيُرفع دائماً.
+
 ## ثلاث واجهات، محرّك واحد
 
 </div>
@@ -510,6 +552,7 @@ python -m reason bench --namespace acme/invoices
 reason/
   llm.py         عميل متوافق مع OpenAI ومع واجهة Messages من Anthropic (urllib)، مخرجات صارمة أو json_object، إعادة محاولة
   jev.py         محوّل Jev (TypeSafe)، واجهة chat() نفسها
+  client.py      عميل Python: مهلة، إعادة محاولة، إجراء احتياطي آمن
   lessons.py     دفتر الدروس لكل نطاق: عدّادات، إزالة تكرار، تقليم، طابور انتظار
   reflector.py   فشل → مقترحات دروس
   bench.py       منصّة الإثبات: القواعد، الحقن، المزوّدون، التزامن، الانهيار، العزل، خطوط الأساس
@@ -520,7 +563,7 @@ reason/
   calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
   poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
   vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
-  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
 tests/test_reason.py         60 اختباراً دون شبكة

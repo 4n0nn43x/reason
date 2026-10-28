@@ -184,6 +184,7 @@ python -m reason lessons acme/invoices approve L-003
 - **Jev**（TypeSafe AI）是可选的：只有当某个模型声明 `"provider": "jev"` 时才会加载。它是类型化决策模型，不是 LLM：远低于一秒给出校准过的选择，可直连或经 OpenRouter（`base_url` 为 `https://openrouter.ai/api`）。它不返回参数也不解释，因此需要参数的动作会升级到推理器。
 - 对没有严格结构化输出的供应商（DeepSeek）设 `json_schema: false`：Reason 退回 `json_object` 并在本地校验。
 - OpenAI 推理模型用 `temperature: null` 与 `max_tokens_key: "max_completion_tokens"`；`extra` 原样透传任何供应商专有字段。
+- `price_in` / `price_out`（每百万输入 / 输出 token 的美元价格）为每次模型调用计价；见「成本、预算与降级模式」一节。
 
 ## 规则（P0）
 
@@ -200,6 +201,17 @@ python -m reason lessons acme/invoices approve L-003
 ```
 
 当动作是有效候选时，`decide` 直接绕过模型（0 毫秒，0 美元）。`forbid` 否决模型的输出：该动作落到下一层，再到人类。运算符：`eq ne gt gte lt lte in nin contains exists regex`。供模型阅读的自然语言策略放在 `policy.md`。
+
+交易中值得加的两条规则：7 天内未查看新闻则不买入（日期缺失同样拦截：`within_hours` 为假，`not` 使其为真），以及订单金额不得超过可用现金。调用方计算 `cash_available`（现金减去待成交订单）并放入 `state`；多笔订单之间的仓位与预算分配留在你的代码里，Reason 只负责否决。
+
+```json
+[
+  {"id": "news-fresh", "if": {"not": {"path": "state.facts.news_checked_at", "op": "within_hours", "value": 168}},
+   "forbid": ["buy"], "reason": "7 天内未查看新闻"},
+  {"id": "cash", "if": [{"path": "state.facts.order_amount", "op": "gt", "path2": "state.facts.cash_available"}],
+   "forbid": ["buy"], "reason": "订单超过可用现金"}
+]
+```
 
 ## 可评分的估计、延迟结果、规则与经验
 
@@ -315,6 +327,36 @@ author: human
 
 `doctrine/` 中的文件视为已批准，`postmortems/` 中的视为待审，除非 `status:` 另有说明。没有来源的经验会被隔离，重复 id 会被忽略并报告，过期经验自动退出。在 Obsidian 中批准（修改 `status:` 或移动文件）会在下一次决策时生效。Reason 把新提案写成新文件，**从不修改知识库中已有的文件**；计数保存在 Reason 自己的数据中。
 
+## 成本、预算与降级模式
+
+每个调用过模型的决策都带有 `cost`：`tokens_in`、`tokens_out`、`usd`（模型声明了 `price_in` 与 `price_out` 时）以及 `by_tier`。由规则做出的决策不产生费用，也没有 `cost`。
+
+```json
+{
+  "models": {"reasoner": {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY",
+                          "model": "claude-opus-5-5", "reasoning_effort": "high", "price_in": 4, "price_out": 20}},
+  "budgets": {"trader/*": {"usd_per_day": 5}},
+  "fallback": {"trader/*": "hold"}
+}
+```
+
+- **每日预算**按命名空间设置（UTC 日，`usd_per_day` 和/或 `tokens_per_day`）：达到后不再调用任何模型，决策转入回退动作，否则交给人类，并标记 `budget_exhausted: true`。花费从日志重建，因此跨重启、跨进程有效。仅覆盖 `/decide`，不含 `/estimate`、`/execute` 和影子模式。
+- **回退**：当没有任何模型作答（服务商故障、额度耗尽、预算用完）时，Reason 返回声明的动作（按命名空间通配的 `fallback`，或单次请求的 `constraints.on_model_failure`），并标记 `tier: "fallback"`、`degraded: true`。该动作必须是候选动作（或 `abstain`）、未被规则禁止、且无需参数即有效；否则交给人类。规则始终优先：「仅用规则、不买入」可写成一条强制或禁止规则加 `"fallback": "hold"`。模型作答但置信度低属于正常升级，不触发回退。告警由调用方负责：关注 `degraded`。
+- **成本与价值**：`python -m reason value <ns> [--days 30]` 按层级、决策点、日期和经验汇报花费（美元、token、每个决策的美元）、已结算结果、成功率，以及随结果上报的 `value`（均值、90 % 置信区间、总和）。上报你真正关心的价值，例如扣除费用后相对基准指数的超额收益，并附上 `value_unit`。价值只用于度量，从不用来加权经验的记分：一笔走运的极端交易就会主导结果。
+
+### Python 客户端
+
+`reason.client.Client`（标准库）：超时、重试、安全回退。
+
+```python
+from reason.client import Client
+rc = Client("http://127.0.0.1:8787", token=os.environ["REASON_TOKEN"], timeout=30, retries=2)
+dec = rc.decide(request, fallback="hold")
+rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.012, "value_unit": "excess_return"})
+```
+
+所有路由在连接被拒绝时都会重试；超时、409 或 5xx 只对幂等路由重试。`decide` 会变成幂等：缺少 `idempotency_key` 时自动生成，重发得到同一个决策。`/estimate` 与 `/execute`（计费的模型调用）超时后绝不重发。设置 `fallback` 后，服务不可达时返回 `tier: "client_fallback"`、`degraded: true`；4xx（无效请求、令牌被拒）总是抛出。
+
 ## 三个门面，一个引擎
 
 ```mermaid
@@ -418,6 +460,7 @@ python -m reason bench --namespace acme/invoices
 reason/
   llm.py         兼容 OpenAI 与 Anthropic Messages API 的客户端（urllib），严格或 json_object 输出，重试
   jev.py         Jev（TypeSafe）适配器，相同的 chat() 接口
+  client.py      Python 客户端：超时、重试、安全回退
   lessons.py     按命名空间的经验手册：计数器、去重、修剪、待审队列
   reflector.py   失败 → 经验提案
   bench.py       证明测试台：规则、注入、提供方、并发、崩溃、隔离、基线
@@ -428,7 +471,7 @@ reason/
   calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
   poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
   vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
-  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
 tests/test_reason.py         60 个离线测试

@@ -226,6 +226,91 @@ class TestEngine(unittest.TestCase):
             eng.execute({"namespace": "acme/invoices", "task": "t", "output_schema": {"type": "object", "properties": {"total": {"type": "number"}}}})
 
 
+class Priced(FakeLLM):
+    """Faux modèle tarifé : 1000 tokens d'entrée et 200 de sortie par appel, à 3 et 15 USD le million."""
+    price_in, price_out = 3.0, 15.0
+
+    def chat(self, messages, schema=None, temperature=0.0, max_tokens=None, retries=1):
+        out, _ = super().chat(messages, schema, temperature, max_tokens, retries)
+        return out, {"prompt_tokens": 1000, "completion_tokens": 200}
+
+
+class TestCostBudgetFallback(unittest.TestCase):
+    def test_cost_budget_and_value_report(self):
+        from reason.evalrun import value_report
+        tmp = tempfile.mkdtemp()
+        dec = Priced("d", [typed("approve", conf=0.5), typed("approve")])
+        rsn = Priced("r", [typed("approve")])
+        eng = engine(tmp, decider=dec, reasoner=rsn)
+        eng.config["budgets"] = {"acme/*": {"usd_per_day": 0.01}}
+        d1 = eng.decide(req(run_id="c1"))                       # décideur peu sûr puis raisonneur : 2 appels
+        self.assertEqual(d1["tier"], "reasoner")
+        self.assertEqual(d1["cost"]["tokens_in"], 2000)
+        self.assertAlmostEqual(d1["cost"]["usd"], 2 * (1000 * 3 + 200 * 15) / 1e6)
+        self.assertEqual(set(d1["cost"]["by_tier"]), {"decider", "reasoner"})
+        eng.outcome({"decision_id": d1["decision_id"], "result": "success", "value": 0.04, "value_unit": "return"})
+        eng.config["budgets"] = {"acme/*": {"usd_per_day": 0.012}}
+        d2 = eng.decide(req(run_id="c2"))                       # 0.012 USD déjà dépensés : aucun appel modèle
+        self.assertEqual((d2["action"]["name"], d2["budget_exhausted"], d2["degraded"]), ("ask_human", True, True))
+        self.assertEqual(len(dec.calls), 1)
+        eng.config["fallback"] = {"acme/*": "escalate"}
+        d3 = eng.decide(req(run_id="c3"))
+        self.assertEqual((d3["tier"], d3["action"]["name"], d3["degraded"]), ("fallback", "escalate", True))
+        eng2 = Engine({"data_dir": tmp, "models": {}, "roles": {}, "budgets": {"acme/*": {"usd_per_day": 0.012}}})
+        self.assertIsNotNone(eng2.over_budget("acme/invoices"))     # dépense relue depuis le journal
+        rep = value_report(eng, "acme/invoices")
+        self.assertEqual(rep["by_tier"]["reasoner"]["value_mean"], 0.04)
+        self.assertAlmostEqual(rep["total"]["usd"], 0.012)
+        self.assertEqual(rep["by_tier"]["fallback"]["decisions"], 1)
+
+    def test_fallback_on_provider_failure(self):
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [LLMError("402 crédit épuisé")] * 3))
+        d = eng.decide(req(run_id="f1", constraints={"on_model_failure": "escalate"}))
+        self.assertEqual((d["tier"], d["action"]["name"], d["model_errors"]), ("fallback", "escalate", 1))
+        d = eng.decide(req(run_id="f2", constraints={"on_model_failure": "approve"}))   # exige des paramètres : refusé
+        self.assertEqual((d["action"]["name"], d["degraded"]), ("ask_human", True))
+        eng2 = engine(tempfile.mkdtemp(), decider=FakeLLM("d", [typed("approve", conf=0.1)]))
+        d = eng2.decide(req(run_id="f3", constraints={"on_model_failure": "escalate"}))   # le modèle a répondu : pas de repli
+        self.assertEqual((d["action"]["name"], d["degraded"]), ("ask_human", False))
+
+
+class TestClient(unittest.TestCase):
+    def test_retry_idempotency_and_fallback(self):
+        from http.server import BaseHTTPRequestHandler
+        from reason.client import Client, ReasonError
+        seen = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append((self.path, body))
+                code = 503 if len(seen) == 1 else 400 if self.path == "/execute" else 200
+                data = json.dumps({"decision_id": "d_1", "key": body.get("idempotency_key")}).encode()
+                self.send_response(code); self.send_header("Content-Length", str(len(data))); self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            c = Client(f"http://127.0.0.1:{srv.server_address[1]}", token="t", backoff=0)
+            r = c.decide(req())                                   # 503 puis 200, même clé d'idempotence
+            self.assertEqual(r["decision_id"], "d_1")
+            self.assertEqual(seen[0][1]["idempotency_key"], seen[1][1]["idempotency_key"])
+            with self.assertRaises(ReasonError) as e:
+                c.execute({"namespace": "a/b", "task": "t"})      # 4xx : jamais masqué
+            self.assertEqual(e.exception.status, 400)
+        finally:
+            srv.shutdown(); srv.server_close()
+        dead = Client(f"http://127.0.0.1:{srv.server_address[1]}", retries=1, backoff=0, timeout=2)
+        fb = dead.decide(req(), fallback="escalate")
+        self.assertEqual((fb["tier"], fb["action"]["name"], fb["degraded"]), ("client_fallback", "escalate", True))
+        with self.assertRaises(ReasonError):
+            dead.decide(req())
+
+
 class TestAnthropic(unittest.TestCase):
     def test_messages_api_body_and_parsing(self):
         from reason.llm import LLM

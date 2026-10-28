@@ -1,5 +1,5 @@
 """CLI : reason serve | decide | outcome | execute | estimate | estimate-outcome | lessons | rules | eval | outcomes |
-calibrate | poll | pending | fingerprint | bench | shadow | init"""
+calibrate | value | poll | pending | fingerprint | bench | shadow | init"""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ from pathlib import Path
 from .bench import run as bench_run
 from .core import Engine
 from .evalrun import (calibration_report, compare_lessons, counterfactual_lessons, fingerprint, fit_calibration,
-                      fit_decision_calibration, outcome_summary, replay, shadow_report, simulate_rules)
+                      fit_decision_calibration, outcome_summary, replay, shadow_report, simulate_rules, value_report)
 from .poller import run as poll_run
 from .rules import Rules
 from .server import load_config, serve
@@ -62,6 +62,8 @@ def main(argv=None) -> int:
     c.add_argument("--limit", type=int)
     c.add_argument("--decisions", action="store_true", help="calibre la confiance du décideur sur les issues et apprend les seuils d'escalade")
     c.add_argument("--target-accuracy", type=float, default=0.9)
+    va = sub.add_parser("value", help="coût et valeur des décisions par palier, point de décision, jour et leçon")
+    va.add_argument("namespace"); va.add_argument("--days", type=float)
     pl = sub.add_parser("poll"); pl.add_argument("--loop", action="store_true"); pl.add_argument("--interval", type=int, default=300)
     pd = sub.add_parser("pending"); pd.add_argument("namespace")
     sub.add_parser("fingerprint")
@@ -116,6 +118,8 @@ def main(argv=None) -> int:
             out["fit"] = fit_calibration(eng, a.namespace)
         if a.counterfactual:
             out["counterfactual"] = counterfactual_lessons(eng, a.namespace, a.limit)
+    elif a.cmd == "value":
+        out = value_report(eng, a.namespace, a.days)
     elif a.cmd == "poll":
         out = poll_run(eng, cfg, once=not a.loop, interval_s=a.interval)
     elif a.cmd == "pending":

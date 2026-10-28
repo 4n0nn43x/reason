@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import calib, vault
 from .lessons import Playbook
-from .llm import LLM, LLMError
+from .llm import LLM, LLMError, tokens
 from .rules import Rules, parse_instant
 
 META_ACTIONS = ("abstain", "ask_human")
@@ -170,6 +170,7 @@ class Engine:
         self._seen_refs: dict[str, set] = {}                                # decision_id -> source_ref déjà appliqués
         self._journal_offsets: dict[str, int] = {}
         self._journaled: set[str] = set()                                   # ids écrits ou relus dans un journal (purgeables)
+        self._spend: dict[tuple[str, str], dict] = {}                       # (namespace, jour UTC) -> {usd, tokens}
         self._shadow_q: queue.Queue | None = None
         self.refresh()
 
@@ -393,6 +394,11 @@ class Engine:
         if req.get("idempotency_key"):
             self._by_key[(req["namespace"], req["idempotency_key"])] = dec
         self._by_id[dec["decision_id"]] = {"request": req, "decision": dec, "ts": ts or time.time()}
+        if dec.get("cost"):
+            day = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).date().isoformat()
+            s = self._spend.setdefault((req["namespace"], day), {"usd": 0.0, "tokens": 0})
+            s["usd"] += dec["cost"].get("usd") or 0.0
+            s["tokens"] += dec["cost"]["tokens_in"] + dec["cost"]["tokens_out"]
         if req.get("run_id"):
             k = (req["run_id"], req["decision_point"])
             self._runs[k] = self._runs.get(k, 0) + 1
@@ -526,7 +532,15 @@ class Engine:
 
     def _decide(self, req: dict, dry_run: bool = False, lessons_override=None) -> dict:
         ns = req["namespace"]
-        finish = (lambda ns_, req_, dec_: dec_) if dry_run else self._finish
+        spend: dict[str, dict] = {}          # palier -> {calls, tokens_in, tokens_out, usd}
+
+        def finish(ns_, req_, dec_):
+            if spend:
+                usd = [t["usd"] for t in spend.values() if t["usd"] is not None]
+                dec_["cost"] = {"tokens_in": sum(t["tokens_in"] for t in spend.values()),
+                                "tokens_out": sum(t["tokens_out"] for t in spend.values()),
+                                "usd": round(sum(usd), 6) if len(usd) == len(spend) else None, "by_tier": spend}
+            return dec_ if dry_run else self._finish(ns_, req_, dec_)
         names = [a["name"] for a in req["candidate_actions"]]
         overrides = req.get("models") or {}
         constraints = req.get("constraints") or {}
@@ -569,16 +583,22 @@ class Engine:
         tiers = [("decider", self.thresholds["decider_confidence"])]
         if constraints.get("allow_reasoner", True) and self.model("reasoner", overrides):
             tiers.append(("reasoner", self.thresholds["reasoner_confidence"]))
+        over = None if dry_run else self.over_budget(ns)
+        if over:
+            trace.append(f"budget: {over}")
+            tiers = []
+        answered = 0                         # paliers qui ont répondu (même sans conclure) : le repli ne vaut que sans réponse
         for role, threshold in tiers:
             llm = self.model(role, overrides)
             if llm is None:
                 continue
             n_eff = n_samples if hasattr(llm, "temperature") else 1      # Jev et autres décideurs déterministes : 1 appel
             try:
-                out = self._ask_k(llm, req, lessons_text, names, role, n_eff)
+                out = self._ask_k(llm, req, lessons_text, names, role, n_eff, spend)
             except LLMError as e:
                 trace.append(f"{role}: erreur {e}")
                 continue
+            answered += 1
             action, raw = out["action"], float(out["confidence"])
             # confiance effective : jamais au-dessus de l'accord entre échantillons, puis recalibrée sur les issues réelles
             eff = min(raw, out["agreement"]) if out["n"] > 1 else raw
@@ -610,18 +630,54 @@ class Engine:
                         "n_samples": out["n"], "n_ok": out["n_ok"], "calibrated": bool(fit), "threshold": threshold})
             return finish(ns, req, dec)
 
+        errors = sum(1 for t in trace if ": erreur " in t)
+        if (errors or over) and not answered:          # modèles indisponibles ou budget épuisé : repli déclaré
+            fb = self._fallback(req, forbidden, " | ".join(trace), shown)
+            if fb:
+                fb.update({"degraded": True, "model_errors": errors, "budget_exhausted": bool(over)})
+                return finish(ns, req, fb)
         dec = self._human(req, "escalation", " | ".join(trace) or "aucun palier n'a conclu", shown, [])
         dec["proposed"] = proposal
-        dec["model_errors"] = sum(1 for t in trace if ": erreur " in t)   # escalade causée par une panne de fournisseur
+        dec["model_errors"] = errors                   # escalade causée par une panne de fournisseur
+        dec["degraded"] = bool((errors or over) and not answered)
+        dec["budget_exhausted"] = bool(over)
         return finish(ns, req, dec)
 
-    def _ask_k(self, llm, req: dict, lessons_text: str, names: list[str], role: str, n: int) -> dict:
+    def _fallback(self, req: dict, forbidden: dict, why: str, shown: list[str]) -> dict | None:
+        """Action de repli quand aucun modèle n'a répondu : constraints.on_model_failure, sinon config["fallback"] (glob
+        de namespace -> nom d'action). L'action doit être candidate (ou abstain), non interdite, valide sans paramètres."""
+        name = (req.get("constraints") or {}).get("on_model_failure") or next(
+            (v for g, v in (self.config.get("fallback") or {}).items() if fnmatch.fnmatchcase(req["namespace"], g)), None)
+        if not name or name == "ask_human" or name in forbidden:
+            return None
+        cand = next((a for a in req["candidate_actions"] if a["name"] == name), None)
+        if name != "abstain" and (cand is None or validate({}, cand.get("schema", {"type": "object"}))):
+            return None
+        dec = self._mk(req, "fallback", name, {}, 0.0, f"repli : {why}", shown, [])
+        dec["rollback"] = cand.get("rollback") if cand else None
+        return dec
+
+    def over_budget(self, ns: str) -> str | None:
+        """Motif si le budget du jour (UTC) du namespace est atteint : config["budgets"] glob -> {usd_per_day, tokens_per_day}."""
+        b = next((v for g, v in (self.config.get("budgets") or {}).items() if fnmatch.fnmatchcase(ns, g)), None)
+        if not b:
+            return None
+        self.refresh()
+        with self._lock:
+            s = self._spend.get((ns, datetime.now(timezone.utc).date().isoformat()), {"usd": 0.0, "tokens": 0})
+        if b.get("usd_per_day") is not None and s["usd"] >= b["usd_per_day"]:
+            return f"{s['usd']:.4f} USD dépensés aujourd'hui, budget {b['usd_per_day']}"
+        if b.get("tokens_per_day") is not None and s["tokens"] >= b["tokens_per_day"]:
+            return f"{s['tokens']} tokens consommés aujourd'hui, budget {b['tokens_per_day']}"
+        return None
+
+    def _ask_k(self, llm, req: dict, lessons_text: str, names: list[str], role: str, n: int, spend: dict | None = None) -> dict:
         """n échantillons : action majoritaire, accord = part des votes ; confiance = moyenne des votes majoritaires."""
         temp = 0.7 if (n > 1 and getattr(llm, "temperature", None) is not None) else None
         outs, last = [], None
         for _ in range(n):
             try:
-                outs.append(self._ask(llm, req, lessons_text, names, role, temperature=temp))
+                outs.append(self._ask(llm, req, lessons_text, names, role, temperature=temp, spend=spend))
             except LLMError as e:
                 last = e
         if not outs:
@@ -633,7 +689,8 @@ class Engine:
         return {**group[0], "action": action, "confidence": sum(float(o["confidence"]) for o in group) / len(group),
                 "agreement": len(group) / n, "n": n, "n_ok": len(outs)}   # accord divisé par n demandé : une panne compte contre
 
-    def _ask(self, llm, req: dict, lessons_text: str, names: list[str], role: str, temperature: float | None = None) -> dict:
+    def _ask(self, llm, req: dict, lessons_text: str, names: list[str], role: str, temperature: float | None = None,
+             spend: dict | None = None) -> dict:
         ns = req["namespace"]
         system = (f"Tu es le décideur du module Reason pour l'automatisation « {ns} », point de décision "
                   f"« {req['decision_point']} ». Choisis UNE action parmi les candidates, ou `abstain` si tu n'es pas sûr, "
@@ -642,8 +699,15 @@ class Engine:
                   f"{UNTRUSTED_NOTE}\n\n## Politique\n{self.policy(ns) or '(aucune)'}\n\n## Leçons apprises\n{lessons_text or '(aucune)'}")
         user = json.dumps({k: req.get(k) for k in ("now", "event", "state", "history", "candidate_actions")}, ensure_ascii=False)
         schema = decision_schema(names)
-        out, _ = llm.chat([{"role": "system", "content": system}, {"role": "user", "content": user}], schema=schema,
-                          temperature=temperature)
+        out, usage = llm.chat([{"role": "system", "content": system}, {"role": "user", "content": user}], schema=schema,
+                              temperature=temperature)
+        if spend is not None:               # compté avant validation : une sortie invalide a quand même été facturée
+            # ponytail: les tokens de cache sont comptés au prix d'entrée plein ; affiner si le cache pèse dans la facture
+            tin, tout = tokens(usage)
+            t = spend.setdefault(role, {"calls": 0, "tokens_in": 0, "tokens_out": 0, "usd": 0.0})
+            t["calls"] += 1; t["tokens_in"] += tin; t["tokens_out"] += tout
+            pi, po = getattr(llm, "price_in", None), getattr(llm, "price_out", None)
+            t["usd"] = None if (pi is None or po is None or t["usd"] is None) else round(t["usd"] + (tin * pi + tout * po) / 1e6, 6)
         errs = validate(out, schema)
         if errs:
             raise LLMError(f"sortie du {role} invalide: {errs}")

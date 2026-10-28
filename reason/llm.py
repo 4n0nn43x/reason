@@ -12,6 +12,7 @@ web=True active la recherche en ligne native du fournisseur (outil web_search ch
 web_search_options ailleurs) ; web_max_uses borne le nombre de recherches. Chez Anthropic les citations de la recherche
 excluent output_config.format : le schéma passe alors dans le prompt et la sortie est validée côté code. `extra` reste
 prioritaire pour tout réglage propre au fournisseur.
+price_in / price_out : prix en USD par million de tokens d'entrée / de sortie, pour chiffrer le coût des décisions.
 """
 from __future__ import annotations
 
@@ -35,11 +36,12 @@ class LLM:
                  json_schema: bool = True, reasoning_effort: str | None = None, timeout: int = 90,
                  extra: dict | None = None, max_tokens: int = 1024, max_tokens_key: str = "max_tokens",
                  temperature: float | None = 0.0, name: str = "llm", provider: str = "openai", web: bool = False,
-                 web_max_uses: int = 5):
+                 web_max_uses: int = 5, price_in: float | None = None, price_out: float | None = None):
         if provider not in ("openai", "anthropic"):
             raise ValueError(f"modèle {name}: provider inconnu {provider!r}")
         self.provider = provider
         self.web, self.web_max_uses = web, web_max_uses
+        self.price_in, self.price_out = price_in, price_out
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key or (os.environ.get(api_key_env) if api_key_env else None)
@@ -55,7 +57,8 @@ class LLM:
     @classmethod
     def from_config(cls, name: str, cfg: dict) -> "LLM":
         known = {"base_url", "model", "api_key", "api_key_env", "json_schema", "reasoning_effort", "timeout", "extra",
-                 "max_tokens", "max_tokens_key", "temperature", "provider", "web", "web_max_uses"}
+                 "max_tokens", "max_tokens_key", "temperature", "provider", "web", "web_max_uses",
+                 "price_in", "price_out"}
         unknown = set(cfg) - known
         if unknown:
             raise ValueError(f"modèle {name}: options inconnues {sorted(unknown)}")
@@ -220,6 +223,14 @@ def _read_sse(lines) -> dict:
     if "stop_reason" not in msg:
         raise _Retryable("flux interrompu avant la fin du message")
     return msg
+
+
+def tokens(usage: dict | None) -> tuple[int, int]:
+    """(entrée, sortie) quel que soit le format d'usage : OpenAI (prompt/completion) ou Anthropic (input/output + cache)."""
+    u = usage or {}
+    tin = u.get("prompt_tokens") or (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) \
+        + (u.get("cache_creation_input_tokens") or 0)
+    return int(tin or 0), int(u.get("completion_tokens") or u.get("output_tokens") or 0)
 
 
 def _parse_json(text: str) -> dict:

@@ -184,6 +184,7 @@ La réponse porte toujours `tier` (`rules`, `decider`, `reasoner`, `loop`, `esca
 - **Jev** (TypeSafe AI) est optionnel, jamais chargé tant qu'aucun modèle ne déclare `"provider": "jev"`. C'est un modèle de décision typée, pas un LLM : choix calibré en bien moins d'une seconde, directement ou via OpenRouter (`base_url` `https://openrouter.ai/api`). Il ne renvoie ni paramètres ni explication, donc les actions qui exigent des paramètres sont escaladées au raisonneur.
 - `json_schema: false` pour les fournisseurs sans sorties structurées strictes (DeepSeek) : Reason passe en `json_object` et valide localement.
 - `temperature: null` et `max_tokens_key: "max_completion_tokens"` pour les modèles de raisonnement OpenAI ; `extra` transmet tel quel tout champ propre au fournisseur.
+- `price_in` / `price_out` (USD par million de tokens d'entrée / de sortie) chiffrent chaque appel modèle ; voir [Coût, budget et mode dégradé](#coût-budget-et-mode-dégradé).
 
 ## Règles (P0)
 
@@ -200,6 +201,17 @@ La réponse porte toujours `tier` (`rules`, `decider`, `reasoner`, `loop`, `esca
 ```
 
 `decide` court-circuite les modèles (0 ms, 0 $) quand l'action est une candidate valide. `forbid` oppose un veto à la sortie des modèles : l'action passe au palier suivant, puis à l'humain. Opérateurs : `eq ne gt gte lt lte in nin contains exists regex`. La politique en prose, lue par les modèles, va dans `policy.md`.
+
+Deux règles utiles en trading : pas d'achat sans lecture de l'actualité de moins de 7 jours (une date absente bloque aussi : `within_hours` est faux et `not` le rend vrai), et pas d'ordre au-dessus du cash encore disponible. L'appelant calcule `cash_available` (cash moins les ordres en attente) et l'envoie dans `state` ; le dimensionnement et le budget répartis sur plusieurs ordres restent dans votre code, Reason ne fait qu'opposer un veto.
+
+```json
+[
+  {"id": "news-fresh", "if": {"not": {"path": "state.facts.news_checked_at", "op": "within_hours", "value": 168}},
+   "forbid": ["buy"], "reason": "actualité non lue depuis 7 jours"},
+  {"id": "cash", "if": [{"path": "state.facts.order_amount", "op": "gt", "path2": "state.facts.cash_available"}],
+   "forbid": ["buy"], "reason": "ordre supérieur au cash disponible"}
+]
+```
 
 ## Estimations scorées, issues différées, règles et leçons
 
@@ -315,6 +327,36 @@ La cote d'avant-match périme au coup d'envoi.
 
 Les fichiers de `doctrine/` sont approuvés, ceux de `postmortems/` en attente, sauf indication contraire de `status:`. Les leçons sans provenance sont mises en quarantaine, les ids dupliqués sont ignorés et signalés, les leçons périmées sortent d'elles-mêmes. Une approbation dans Obsidian (modifier `status:` ou déplacer le fichier) prend effet à la décision suivante. Reason écrit les nouvelles propositions comme de nouveaux fichiers et **ne modifie jamais un fichier existant du vault** ; les compteurs restent dans les données de Reason.
 
+## Coût, budget et mode dégradé
+
+Chaque décision qui a appelé un modèle porte `cost` : `tokens_in`, `tokens_out`, `usd` (si les modèles déclarent `price_in` et `price_out`) et `by_tier`. Une décision prise par règle ne coûte rien et n'a pas de `cost`.
+
+```json
+{
+  "models": {"reasoner": {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY",
+                          "model": "claude-opus-5-5", "reasoning_effort": "high", "price_in": 4, "price_out": 20}},
+  "budgets": {"trader/*": {"usd_per_day": 5}},
+  "fallback": {"trader/*": "hold"}
+}
+```
+
+- **Budget quotidien** par namespace (jour UTC, `usd_per_day` et/ou `tokens_per_day`) : une fois atteint, aucun modèle n'est appelé ; la décision part au repli, sinon à l'humain, avec `budget_exhausted: true`. La dépense est reconstruite depuis le journal, donc elle tient entre redémarrages et processus. Il couvre `/decide`, pas `/estimate`, `/execute` ni le mode shadow.
+- **Repli** : quand aucun modèle n'a répondu (fournisseur en panne, crédit épuisé, budget atteint), Reason renvoie l'action déclarée (`fallback` par glob de namespace, ou `constraints.on_model_failure` par requête) avec `tier: "fallback"` et `degraded: true`. L'action doit être candidate (ou `abstain`), non interdite par une règle et valide sans paramètres ; sinon c'est l'humain. Les règles passent toujours avant : « règles seules, aucun achat » s'écrit avec une règle forcée ou interdite plus `"fallback": "hold"`. Un modèle qui a répondu avec une confiance faible donne une escalade normale, pas un repli. L'alerte revient à l'appelant : surveillez `degraded`.
+- **Coût et valeur** : `python -m reason value <ns> [--days 30]` donne, par palier, point de décision, jour et leçon, la dépense (USD, tokens, USD par décision), les issues réglées, le taux de réussite et la `value` envoyée avec les issues (moyenne, IC à 90 %, somme). Envoyez la valeur qui compte pour vous, par exemple le rendement au-dessus de l'indice de référence net de frais, avec un `value_unit`. La valeur est mesurée, jamais utilisée pour pondérer le crédit des leçons : un seul trade extrême et chanceux l'emporterait.
+
+### Client Python
+
+`reason.client.Client` (stdlib) : délai d'attente, nouvelles tentatives, repli sûr.
+
+```python
+from reason.client import Client
+rc = Client("http://127.0.0.1:8787", token=os.environ["REASON_TOKEN"], timeout=30, retries=2)
+dec = rc.decide(request, fallback="hold")
+rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.012, "value_unit": "excess_return"})
+```
+
+Les nouvelles tentatives ont lieu sur connexion refusée pour toutes les routes, et sur délai dépassé, 409 ou 5xx seulement pour les routes idempotentes. `decide` le devient : une `idempotency_key` est générée si elle manque, donc un renvoi rend la même décision. `/estimate` et `/execute` (appels modèle facturés) ne sont jamais renvoyés après un délai dépassé. Avec `fallback`, un service injoignable donne `tier: "client_fallback"`, `degraded: true` ; une erreur 4xx (requête invalide, jeton refusé) est toujours levée.
+
 ## Trois façades, un moteur
 
 ```mermaid
@@ -418,6 +460,7 @@ vérifie les invariants en volume, à graines fixes et sans réseau, en une diza
 reason/
   llm.py         client compatible OpenAI et API Messages d'Anthropic (urllib), sortie stricte ou json_object, relances
   jev.py         adaptateur Jev (TypeSafe), même interface chat()
+  client.py      client Python : délai, nouvelles tentatives, repli sûr
   lessons.py     playbook par namespace : compteurs, dédup, élagage, file d'attente
   reflector.py   échec → propositions de leçons
   bench.py       banc de preuve : règles, injection, fournisseurs, concurrence, crash, isolation, baselines
@@ -428,7 +471,7 @@ reason/
   calib.py       Brier, log-loss, RPS, décomposition de Murphy, Platt, Wilson, bootstrap (stdlib)
   poller.py      issues différées : sources JSONL / HTTP / GraphQL, watermark, appariement, horizon
   vault.py       vault markdown : leçons en frontmatter, propositions, post-mortems (ne réécrit jamais un fichier existant)
-  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate poll pending fingerprint bench shadow init
+  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
 tests/test_reason.py         60 tests hors ligne
