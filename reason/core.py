@@ -1023,7 +1023,7 @@ def _make_model(name: str, cfg: dict):
     if cfg.get("provider") == "jev":
         from .jev import JevDecider
         return JevDecider(name=name, **{k: v for k, v in cfg.items() if k != "provider"})
-    return LLM.from_config(name, cfg)
+    return LLM.from_config(name, cfg)   # provider "openai" (défaut) ou "anthropic"
 
 
 _ACTION = {"type": "object", "required": ["name"], "additionalProperties": True,

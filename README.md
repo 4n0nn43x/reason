@@ -157,7 +157,7 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 
 ## Models and roles: everything is swappable
 
-`reason.config.json` declares **models** and **roles** that point to them. A model is any OpenAI-compatible chat completions API (OpenAI, DeepSeek, OpenRouter, Together, LiteLLM, vLLM, Ollama) or Jev.
+`reason.config.json` declares **models** and **roles** that point to them. A model is any OpenAI-compatible chat completions API (OpenAI, DeepSeek, OpenRouter, Together, LiteLLM, vLLM, Ollama), the Anthropic Messages API (Claude, `"provider": "anthropic"`), or Jev. None of them is required: pick any mix.
 
 ```json
 {
@@ -181,7 +181,8 @@ The response always carries `tier` (`rules`, `decider`, `reasoner`, `loop`, `esc
 | `reflector` | Turns a failure or a correction into lesson proposals | falls back to `decider`, then `executor` |
 
 - A single model that both decides and executes: `examples/reason.config.executor-only.json`.
-- **Jev** (TypeSafe AI) is a typed-decision model, not an LLM: calibrated choice in well under a second, directly or through OpenRouter (`base_url` `https://openrouter.ai/api`). It returns no parameters and no explanation, so actions that require parameters escalate to the reasoner.
+- **Claude** natively: `{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`. `reasoning_effort` maps to `output_config.effort` (`low` to `max`), the decision schema goes through structured outputs, `temperature` is never sent, and responses are streamed so a long generation does not hit `timeout` (it applies per read). Any role can use it.
+- **Jev** (TypeSafe AI) is optional, never loaded unless a model declares `"provider": "jev"`. It is a typed-decision model, not an LLM: calibrated choice in well under a second, directly or through OpenRouter (`base_url` `https://openrouter.ai/api`). It returns no parameters and no explanation, so actions that require parameters escalate to the reasoner.
 - `json_schema: false` for providers without strict structured outputs (DeepSeek): Reason falls back to `json_object` and validates locally.
 - `temperature: null` and `max_tokens_key: "max_completion_tokens"` for OpenAI reasoning models; `extra` passes any provider-specific field verbatim.
 
@@ -397,7 +398,7 @@ runs the invariants at volume, with fixed seeds and no network, in about ten sec
 
 ```
 reason/
-  llm.py         OpenAI-compatible client (urllib), strict or json_object output, retries
+  llm.py         OpenAI-compatible and Anthropic Messages client (urllib), strict or json_object output, retries
   jev.py         Jev (TypeSafe) adapter, same chat() interface
   lessons.py     per-namespace playbook: counters, dedup, pruning, pending queue
   reflector.py   failure → lesson proposals

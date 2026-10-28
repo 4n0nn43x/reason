@@ -155,7 +155,7 @@ La réponse porte toujours `tier` (`rules`, `decider`, `reasoner`, `loop`, `esca
 
 ## Modèles et rôles : tout est interchangeable
 
-`reason.config.json` déclare des **modèles** et des **rôles** qui pointent vers eux. Un modèle est n'importe quelle API chat completions compatible OpenAI (OpenAI, DeepSeek, OpenRouter, Together, LiteLLM, vLLM, Ollama) ou Jev.
+`reason.config.json` déclare des **modèles** et des **rôles** qui pointent vers eux. Un modèle est n'importe quelle API chat completions compatible OpenAI (OpenAI, DeepSeek, OpenRouter, Together, LiteLLM, vLLM, Ollama), l'API Messages d'Anthropic (Claude, `"provider": "anthropic"`) ou Jev. Aucun n'est obligatoire : combinez-les librement.
 
 ```json
 {
@@ -179,7 +179,8 @@ La réponse porte toujours `tier` (`rules`, `decider`, `reasoner`, `loop`, `esca
 | `reflector` | Transforme un échec ou une correction en propositions de leçons | retombe sur `decider`, puis `executor` |
 
 - Un seul modèle qui décide et exécute : `examples/reason.config.executor-only.json`.
-- **Jev** (TypeSafe AI) est un modèle de décision typée, pas un LLM : choix calibré en bien moins d'une seconde, directement ou via OpenRouter (`base_url` `https://openrouter.ai/api`). Il ne renvoie ni paramètres ni explication, donc les actions qui exigent des paramètres sont escaladées au raisonneur.
+- **Claude** en natif : `{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`. `reasoning_effort` devient `output_config.effort` (`low` à `max`), le schéma de décision passe par les sorties structurées, `temperature` n'est jamais envoyé, et la réponse est lue en streaming pour qu'une longue génération ne dépasse pas `timeout` (il s'applique à chaque lecture). Utilisable pour n'importe quel rôle.
+- **Jev** (TypeSafe AI) est optionnel, jamais chargé tant qu'aucun modèle ne déclare `"provider": "jev"`. C'est un modèle de décision typée, pas un LLM : choix calibré en bien moins d'une seconde, directement ou via OpenRouter (`base_url` `https://openrouter.ai/api`). Il ne renvoie ni paramètres ni explication, donc les actions qui exigent des paramètres sont escaladées au raisonneur.
 - `json_schema: false` pour les fournisseurs sans sorties structurées strictes (DeepSeek) : Reason passe en `json_object` et valide localement.
 - `temperature: null` et `max_tokens_key: "max_completion_tokens"` pour les modèles de raisonnement OpenAI ; `extra` transmet tel quel tout champ propre au fournisseur.
 
@@ -395,7 +396,7 @@ vérifie les invariants en volume, à graines fixes et sans réseau, en une diza
 
 ```
 reason/
-  llm.py         client compatible OpenAI (urllib), sortie stricte ou json_object, relances
+  llm.py         client compatible OpenAI et API Messages d'Anthropic (urllib), sortie stricte ou json_object, relances
   jev.py         adaptateur Jev (TypeSafe), même interface chat()
   lessons.py     playbook par namespace : compteurs, dédup, élagage, file d'attente
   reflector.py   échec → propositions de leçons

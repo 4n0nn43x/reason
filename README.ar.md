@@ -181,7 +181,7 @@ python -m reason lessons acme/invoices approve L-003
 
 ## النماذج والأدوار: كل شيء قابل للاستبدال
 
-يعلن `reason.config.json` عن **نماذج** و**أدوار** تشير إليها. النموذج هو أي واجهة chat completions متوافقة مع OpenAI (OpenAI، DeepSeek، OpenRouter، Together، LiteLLM، vLLM، Ollama) أو Jev.
+يعلن `reason.config.json` عن **نماذج** و**أدوار** تشير إليها. النموذج هو أي واجهة chat completions متوافقة مع OpenAI (OpenAI، DeepSeek، OpenRouter، Together، LiteLLM، vLLM، Ollama)، أو واجهة Messages من Anthropic (Claude، `"provider": "anthropic"`)، أو Jev. لا شيء منها إلزامي: اجمع بينها كما تشاء.
 
 </div>
 
@@ -209,7 +209,8 @@ python -m reason lessons acme/invoices approve L-003
 | `reflector` | يحوّل الفشل أو التصحيح إلى مقترحات دروس | يرجع إلى `decider` ثم `executor` |
 
 - نموذج واحد يقرّر وينفّذ معاً: `examples/reason.config.executor-only.json`.
-- **Jev** (TypeSafe AI) نموذج قرار مُنمَّط وليس نموذج لغة: اختيار معاير في أقل من ثانية بكثير، مباشرة أو عبر OpenRouter (`base_url` هو `https://openrouter.ai/api`). لا يعيد معاملات ولا تفسيراً، لذا تُصعَّد الإجراءات التي تتطلب معاملات إلى المُستدِل.
+- **Claude** مباشرةً: `{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`. يتحوّل `reasoning_effort` إلى `output_config.effort` (من `low` إلى `max`)، ويمرّ مخطط القرار عبر المخرجات المهيكلة، ولا يُرسَل `temperature` أبداً، وتُقرأ الاستجابة بالبث كي لا يتجاوز التوليد الطويل `timeout` (يُطبَّق على كل قراءة). يصلح لأي دور.
+- **Jev** (TypeSafe AI) اختياري، ولا يُحمَّل إلا إذا أعلن نموذج `"provider": "jev"`. وهو نموذج قرار مُنمَّط وليس نموذج لغة: اختيار معاير في أقل من ثانية بكثير، مباشرة أو عبر OpenRouter (`base_url` هو `https://openrouter.ai/api`). لا يعيد معاملات ولا تفسيراً، لذا تُصعَّد الإجراءات التي تتطلب معاملات إلى المُستدِل.
 - `json_schema: false` للمزوّدين الذين لا يدعمون المخرجات المهيكلة الصارمة (DeepSeek): يرجع Reason إلى `json_object` ويتحقّق محلياً.
 - `temperature: null` و`max_tokens_key: "max_completion_tokens"` لنماذج الاستدلال من OpenAI؛ و`extra` يمرّر أي حقل خاص بالمزوّد كما هو.
 
@@ -487,7 +488,7 @@ python -m reason bench --namespace acme/invoices
 
 ```
 reason/
-  llm.py         عميل متوافق مع OpenAI (urllib)، مخرجات صارمة أو json_object، إعادة محاولة
+  llm.py         عميل متوافق مع OpenAI ومع واجهة Messages من Anthropic (urllib)، مخرجات صارمة أو json_object، إعادة محاولة
   jev.py         محوّل Jev (TypeSafe)، واجهة chat() نفسها
   lessons.py     دفتر الدروس لكل نطاق: عدّادات، إزالة تكرار، تقليم، طابور انتظار
   reflector.py   فشل → مقترحات دروس

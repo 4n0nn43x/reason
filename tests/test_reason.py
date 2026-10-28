@@ -226,6 +226,48 @@ class TestEngine(unittest.TestCase):
             eng.execute({"namespace": "acme/invoices", "task": "t", "output_schema": {"type": "object", "properties": {"total": {"type": "number"}}}})
 
 
+class TestAnthropic(unittest.TestCase):
+    def test_messages_api_body_and_parsing(self):
+        from reason.llm import LLM
+        m = core._make_model("c", {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key": "k",
+                                   "model": "claude-opus-5-5", "reasoning_effort": "low"})
+        sent = []
+        m._post = lambda body, path="/chat/completions": (sent.append((path, body)) or {
+            "stop_reason": "end_turn", "usage": {"output_tokens": 3},
+            "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": '{"action": "pay"}'}]})
+        out, _ = m.chat([{"role": "system", "content": "S"}, {"role": "user", "content": "U"}], schema={"type": "object"})
+        self.assertIsInstance(m, LLM)
+        self.assertEqual(out, {"action": "pay"})
+        path, body = sent[0]
+        self.assertEqual(path, "/messages")
+        self.assertEqual(body["system"], "S")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "U"}])
+        self.assertEqual(body["output_config"], {"effort": "low", "format": {"type": "json_schema", "schema": {"type": "object"}}})
+        self.assertNotIn("temperature", body)
+        self.assertTrue(body["stream"])
+        m._post = lambda body, path="": {"stop_reason": "refusal", "content": []}
+        with self.assertRaises(LLMError):
+            m.chat([{"role": "user", "content": "U"}])
+
+
+    def test_sse_stream_is_reassembled(self):
+        from reason.llm import _read_sse, _Retryable
+        ev = lambda d: b"data: " + json.dumps(d).encode() + b"\n"
+        stream = [b"event: message_start\n", ev({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+                  ev({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+                  ev({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+                  ev({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": '{"a":'}}),
+                  ev({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": " 1}"}}),
+                  ev({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}})]
+        msg = _read_sse(stream)
+        self.assertEqual(msg["content"][1]["text"], '{"a": 1}')
+        self.assertEqual(msg["usage"], {"input_tokens": 5, "output_tokens": 4})
+        with self.assertRaises(_Retryable):
+            _read_sse(stream[:-1])
+        with self.assertRaises(_Retryable):
+            _read_sse([ev({"type": "error", "error": {"type": "overloaded_error"}})])
+
+
 class TestJev(unittest.TestCase):
     def test_jev_adapter_maps_choice_and_escalates_on_params(self):
         from reason.jev import JevDecider

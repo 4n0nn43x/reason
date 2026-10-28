@@ -155,7 +155,7 @@ python -m reason lessons acme/invoices approve L-003
 
 ## 模型与角色：一切可替换
 
-`reason.config.json` 声明**模型**和指向它们的**角色**。模型可以是任何兼容 OpenAI 的 chat completions API（OpenAI、DeepSeek、OpenRouter、Together、LiteLLM、vLLM、Ollama）或 Jev。
+`reason.config.json` 声明**模型**和指向它们的**角色**。模型可以是任何兼容 OpenAI 的 chat completions API（OpenAI、DeepSeek、OpenRouter、Together、LiteLLM、vLLM、Ollama）、Anthropic Messages API（Claude，`"provider": "anthropic"`）或 Jev。没有任何一个是必需的，可自由组合。
 
 ```json
 {
@@ -179,7 +179,8 @@ python -m reason lessons acme/invoices approve L-003
 | `reflector` | 把失败或纠正转化为经验提案 | 回退到 `decider`，再到 `executor` |
 
 - 单个模型既决策又执行：`examples/reason.config.executor-only.json`。
-- **Jev**（TypeSafe AI）是类型化决策模型，不是 LLM：远低于一秒给出校准过的选择，可直连或经 OpenRouter（`base_url` 为 `https://openrouter.ai/api`）。它不返回参数也不解释，因此需要参数的动作会升级到推理器。
+- **Claude** 原生接入：`{"provider": "anthropic", "base_url": "https://api.anthropic.com/v1", "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "reasoning_effort": "high"}`。`reasoning_effort` 映射为 `output_config.effort`（`low` 到 `max`），决策 schema 走结构化输出，从不发送 `temperature`，响应以流式读取，长生成不会超过 `timeout`（按每次读取计算）。任何角色都可使用。
+- **Jev**（TypeSafe AI）是可选的：只有当某个模型声明 `"provider": "jev"` 时才会加载。它是类型化决策模型，不是 LLM：远低于一秒给出校准过的选择，可直连或经 OpenRouter（`base_url` 为 `https://openrouter.ai/api`）。它不返回参数也不解释，因此需要参数的动作会升级到推理器。
 - 对没有严格结构化输出的供应商（DeepSeek）设 `json_schema: false`：Reason 退回 `json_object` 并在本地校验。
 - OpenAI 推理模型用 `temperature: null` 与 `max_tokens_key: "max_completion_tokens"`；`extra` 原样透传任何供应商专有字段。
 
@@ -395,7 +396,7 @@ python -m reason bench --namespace acme/invoices
 
 ```
 reason/
-  llm.py         兼容 OpenAI 的客户端（urllib），严格或 json_object 输出，重试
+  llm.py         兼容 OpenAI 与 Anthropic Messages API 的客户端（urllib），严格或 json_object 输出，重试
   jev.py         Jev（TypeSafe）适配器，相同的 chat() 接口
   lessons.py     按命名空间的经验手册：计数器、去重、修剪、待审队列
   reflector.py   失败 → 经验提案

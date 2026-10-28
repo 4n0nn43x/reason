@@ -9,6 +9,7 @@
 - **Rule simulation**: `reason rules <ns> simulate --candidate FILE` replays candidate rules on journaled requests without model calls and reports changed decisions, errors avoided or introduced, and escalations added or automated.
 - **Claude Code hook: human answers, `defer`, `updatedInput`.** `POST /hooks/claude/answer` (new `approve` scope, distinct from `outcome`) records allow/deny with an optional `updated_input` for an escalated tool call; it applies to the same decision and to the same call in the same session (SHA-256 of tool name and full input, signed with `data_dir/hook.key` so decisions forged through `/decide` are refused), the latest answer wins, `deny` overrides any decision, `allow` only settles an escalation. `REASON_HOOK_DEFER=1` returns `defer` for unanswered escalations (`claude -p` only). A concurrent decision for the same call returns `ask` with HTTP 200 instead of 409.
 - MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) on the five tools.
+- **Native Claude support**: `"provider": "anthropic"` on a model calls the Anthropic Messages API (still stdlib only) for any role. `reasoning_effort` maps to `output_config.effort`, decision schemas use structured outputs, `temperature` is never sent, responses are streamed (SSE) so long generations do not hit `timeout`, and `max_tokens` truncation or a `refusal` is an error. Jev stays optional.
 
 ### Fixed
 - `Content-Length` is validated (digits only, single value, no `Transfer-Encoding`), else 400 and the connection is closed.
