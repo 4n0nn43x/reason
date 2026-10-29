@@ -193,16 +193,23 @@ class Telegram:
         if not self.engine.config.get("chat"):
             return
         with self._chat_lock:
-            try:
-                self.call("sendChatAction", {"chat_id": self.chat_id, "action": "typing"})
-            except TelegramError:
-                pass
+            done = threading.Event()
+
+            def typing():                   # Telegram efface « écrit… » après ~5 s : renvoyé jusqu'à la réponse
+                while not done.is_set():
+                    try:
+                        self.call("sendChatAction", {"chat_id": self.chat_id, "action": "typing"})
+                    except TelegramError:
+                        pass
+                    done.wait(4)
+            threading.Thread(target=typing, daemon=True).start()
             try:
                 from .chat import Chat
                 reply = Chat(self.engine).ask(text, list(self._history))["reply"]
                 self._history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
             except Exception as e:  # noqa: BLE001  le chat ne doit jamais faire tomber la lecture des boutons
                 reply = f"Erreur : {str(e)[:300]}"
+            done.set()
             try:   # texte brut : la réponse du modèle n'a pas à être du HTML valide
                 for i in range(0, len(reply), MAX_TEXT):
                     self.call("sendMessage", {"chat_id": self.chat_id, "text": reply[i:i + MAX_TEXT],
