@@ -1,5 +1,5 @@
 """CLI : reason serve | decide | outcome | execute | estimate | estimate-outcome | lessons | rules | eval | outcomes |
-calibrate | value | telegram-test | poll | pending | fingerprint | bench | shadow | init"""
+calibrate | value | chat | telegram-test | poll | pending | fingerprint | bench | shadow | init"""
 from __future__ import annotations
 
 import argparse
@@ -64,6 +64,7 @@ def main(argv=None) -> int:
     c.add_argument("--target-accuracy", type=float, default=0.9)
     va = sub.add_parser("value", help="coût et valeur des décisions par palier, point de décision, jour et leçon")
     va.add_argument("namespace"); va.add_argument("--days", type=float)
+    ch = sub.add_parser("chat", help="question en lecture seule au modèle connecté (config chat)"); ch.add_argument("message")
     sub.add_parser("telegram-test", help="envoie un message de test au chat Telegram configuré")
     pl = sub.add_parser("poll"); pl.add_argument("--loop", action="store_true"); pl.add_argument("--interval", type=int, default=300)
     pd = sub.add_parser("pending"); pd.add_argument("namespace")
@@ -121,6 +122,12 @@ def main(argv=None) -> int:
             out["counterfactual"] = counterfactual_lessons(eng, a.namespace, a.limit)
     elif a.cmd == "value":
         out = value_report(eng, a.namespace, a.days)
+    elif a.cmd == "chat":
+        from .chat import Chat
+        if not cfg.get("chat"):
+            print("chat non configuré (config.chat)", file=sys.stderr); return 1
+        out = Chat(eng).ask(a.message)
+        print(out["reply"]); return 0
     elif a.cmd == "telegram-test":
         if not (eng.telegram and eng.telegram.enabled):
             print("telegram non configuré (config.telegram, token et chat_id)", file=sys.stderr); return 1

@@ -4,6 +4,7 @@
   POST /hooks/claude   hook http de Claude Code : PreToolUse → decide, SessionStart/UserPromptSubmit → leçons
   POST /hooks/claude/answer   réponse humaine à un appel d'outil escaladé (scope approve)
   POST /decisions/answer      réponse humaine à une décision escaladée (scope approve) ; GET /decisions/<id> (scope read)
+  POST /chat                  conversation en lecture seule (config chat, scope read sur tous les namespaces)
   POST /telegram/callback     clic sur un bouton Reason relayé par l'application qui lit le bot partagé (scope approve)
 Stdlib uniquement (ThreadingHTTPServer).
 """
@@ -239,6 +240,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._claude_hook(body))
             if self.path == "/hooks/claude/answer":
                 return self._json(200, self._hook_answer(body))
+            if self.path == "/chat":
+                if not self.engine.config.get("chat"):
+                    return self._json(404, {"error": "chat non configuré"})
+                self._check("read", "*")             # lit plusieurs namespaces : jeton administrateur ou namespaces ["*"]
+                if not isinstance(body.get("message"), str):
+                    raise ValueError("message (texte) requis")
+                from .chat import Chat
+                return self._json(200, Chat(self.engine).ask(body["message"], body.get("history") if isinstance(body.get("history"), list) else None))
             if self.path == "/decisions/answer":
                 self._check("approve", self._ns_of("answer", body))
                 return self._json(200, self.engine.answer(body))

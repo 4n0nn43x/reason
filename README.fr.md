@@ -383,6 +383,21 @@ app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
 
 `POST /decisions/answer` (`Client.answer`) enregistre une réponse sans Telegram, avec des paramètres si l'action en demande. `python -m reason telegram-test` vérifie le token et le chat.
 
+### Chat en lecture seule
+
+Posez des questions en langage courant (« qu'est-ce qui m'attend ? », « pourquoi a-t-on acheté ça ? », « le canal web est-il calibré ? ») avec le modèle connecté à Reason, quel qu'il soit : rôle `chat`, sinon `executor`. Compatible OpenAI ou Claude ; Jev, qui ne converse pas, est refusé. Les outils passent par la sortie structurée que Reason obtient déjà de chaque fournisseur : aucun tool calling propre à un fournisseur n'est nécessaire.
+
+```json
+"roles": {"chat": "deepseek"},
+"chat": {"namespaces": ["trader/*"], "max_steps": 5,
+         "tools": [{"name": "compte", "description": "equity, cash, positions, 24 h and 7 d change", "url": "http://127.0.0.1:8090/compte"},
+                   {"name": "logs", "description": "last agent log lines; args: {\"grep\": str}", "url": "http://127.0.0.1:8090/logs"}]}
+```
+
+- **Outils intégrés**, en lecture seule : `namespaces`, `recent` (dernières décisions avec motif, réponse humaine et issue), `decision`, `pending` (escalades qui attendent un humain, décisions qui attendent une issue), `value`, `calibration`, `outcomes`, `lessons`, limités à `chat.namespaces`.
+- **Outils du projet hôte** : un `GET` sur une URL déclarée dans la config ; le modèle ne choisit que les arguments (query string), jamais l'URL. N'y exposez que des données en lecture. Aucun outil n'écrit, n'exécute, ne trade ni ne répond à une escalade : le chat ne peut pas agir, même si le texte d'une page ou d'un marché lu par un outil essaie de l'y pousser.
+- **Où** : sur Telegram, un message texte du chat configuré reçoit la réponse (bot dédié, `poll: true` ; les 6 derniers échanges sont gardés en mémoire) ; `POST /chat {"message", "history"}` (jeton administrateur ou `namespaces: ["*"]`, `Client.chat`) pour un bot partagé ou toute autre interface ; `python -m reason chat "question"` dans un terminal.
+
 ## Trois façades, un moteur
 
 ```mermaid
@@ -488,6 +503,7 @@ reason/
   jev.py         adaptateur Jev (TypeSafe), même interface chat()
   client.py      client Python : délai, nouvelles tentatives, repli sûr
   telegram.py    Telegram : messages d'escalade, boutons de réponse, bot dédié ou partagé
+  chat.py        chat en lecture seule avec tout LLM connecté, outils intégrés et du projet hôte
   lessons.py     playbook par namespace : compteurs, dédup, élagage, file d'attente
   reflector.py   échec → propositions de leçons
   bench.py       banc de preuve : règles, injection, fournisseurs, concurrence, crash, isolation, baselines
@@ -498,7 +514,7 @@ reason/
   calib.py       Brier, log-loss, RPS, décomposition de Murphy, Platt, Wilson, bootstrap (stdlib)
   poller.py      issues différées : sources JSONL / HTTP / GraphQL, watermark, appariement, horizon
   vault.py       vault markdown : leçons en frontmatter, propositions, post-mortems (ne réécrit jamais un fichier existant)
-  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
+  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value chat telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
 tests/test_reason.py         60 tests hors ligne

@@ -72,6 +72,10 @@ class Client:
         """Bot partagé : relaie le callback_data d'un bouton Reason ; afficher le `text` rendu."""
         return self.post("/telegram/callback", {"data": data, "by": by})
 
+    def chat(self, message: str, history: list[dict] | None = None) -> dict:
+        """Conversation en lecture seule : {"reply", "tools_used", "model"}."""
+        return self._call("POST", "/chat", {"message": message, "history": history or []})
+
     def lessons(self, ns: str) -> dict:
         return self._call("GET", f"/lessons/{ns}", None)
 

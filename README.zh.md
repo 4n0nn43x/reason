@@ -383,6 +383,21 @@ app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
 
 `POST /decisions/answer`（`Client.answer`）可不经 Telegram 记录回答，动作需要参数时可附带参数。`python -m reason telegram-test` 用于检查 token 和聊天。
 
+### 只读对话
+
+用自然语言提问（「有什么在等我处理？」「为什么买了这个？」「web 渠道校准得好吗？」），由接入 Reason 的任意模型回答：使用 `chat` 角色，否则用 `executor`。兼容 OpenAI 或 Claude；不能对话的 Jev 会被拒绝。工具调用借助 Reason 已能从每个服务商获得的结构化输出完成，无需任何服务商专有的 tool calling。
+
+```json
+"roles": {"chat": "deepseek"},
+"chat": {"namespaces": ["trader/*"], "max_steps": 5,
+         "tools": [{"name": "compte", "description": "equity, cash, positions, 24 h and 7 d change", "url": "http://127.0.0.1:8090/compte"},
+                   {"name": "logs", "description": "last agent log lines; args: {\"grep\": str}", "url": "http://127.0.0.1:8090/logs"}]}
+```
+
+- **内置工具**（只读）：`namespaces`、`recent`（最近的决策及理由、人工回答和结果）、`decision`、`pending`（等待人工的升级、等待结果的决策）、`value`、`calibration`、`outcomes`、`lessons`，范围限于 `chat.namespaces`。
+- **宿主项目工具**：对配置中声明的 URL 发起 `GET`；模型只能选择参数（query string），不能选择 URL。只在其中暴露只读数据。没有任何工具能写入、执行、交易或回答升级：即使工具读到的网页或市场文本试图诱导，对话也无法采取行动。
+- **使用位置**：Telegram 上，配置的聊天发来的文字消息会收到回答（专用机器人，`poll: true`；内存中保留最近 6 轮对话）；`POST /chat {"message", "history"}`（管理员令牌或 `namespaces: ["*"]`，`Client.chat`）用于共享机器人或其他界面；终端中用 `python -m reason chat "问题"`。
+
 ## 三个门面，一个引擎
 
 ```mermaid
@@ -488,6 +503,7 @@ reason/
   jev.py         Jev（TypeSafe）适配器，相同的 chat() 接口
   client.py      Python 客户端：超时、重试、安全回退
   telegram.py    Telegram：升级通知、回答按钮、专用或共享机器人
+  chat.py        只读对话，适用于任意接入的 LLM，内置工具与宿主工具
   lessons.py     按命名空间的经验手册：计数器、去重、修剪、待审队列
   reflector.py   失败 → 经验提案
   bench.py       证明测试台：规则、注入、提供方、并发、崩溃、隔离、基线
@@ -498,7 +514,7 @@ reason/
   calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
   poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
   vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
-  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
+  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value chat telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
 tests/test_reason.py         60 个离线测试

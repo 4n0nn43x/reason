@@ -15,6 +15,8 @@ Deux façons de recevoir les clics (callback_data = "<prefix>:<decision_id>:<n°
   - poll: false (bot partagé) : Reason ne fait qu'envoyer ; l'application qui lit les mises à jour transmet les callbacks
     qui commencent par le préfixe à POST /telegram/callback {"data": ..., "by": ...} et affiche le `text` rendu.
 Seul le chat configuré est écouté.
+Avec config["chat"] et poll: true, un message texte du chat configuré reçoit la réponse du chat en lecture seule
+(reason/chat.py) ; en bot partagé, l'application relaie le texte à POST /chat.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from .core import validate
@@ -53,6 +56,8 @@ class Telegram:
         if len(self.prefix) > 16 or ":" in self.prefix:
             raise ValueError("telegram.callback_prefix : 16 caractères au plus, sans « : »")
         self._budget_sent: set[tuple[str, str]] = set()
+        self._history: deque = deque(maxlen=12)      # derniers échanges du chat (un seul chat écouté)
+        self._chat_lock = threading.Lock()           # une question à la fois : l'historique reste ordonné
 
     # --- API Bot
     def call(self, method: str, payload: dict, timeout: float = 15) -> dict:
@@ -160,6 +165,11 @@ class Telegram:
         return {"recorded": r["recorded"], "text": text, "decision_id": rec["decision"]["decision_id"], "action": a["action"]}
 
     def handle_update(self, upd: dict) -> None:
+        m = upd.get("message") or {}
+        if m:
+            if str((m.get("chat") or {}).get("id")) == self.chat_id and isinstance(m.get("text"), str):
+                threading.Thread(target=self._converse, args=(m["text"],), daemon=True).start()
+            return                          # autre chat, ou message sans texte : ignoré
         cq = upd.get("callback_query") or {}
         msg = cq.get("message") or {}
         if str((msg.get("chat") or {}).get("id")) != self.chat_id or not str(cq.get("data", "")).startswith(self.prefix + ":"):
@@ -179,13 +189,34 @@ class Telegram:
         except TelegramError as e:
             print(f"reason: telegram {e}", file=sys.stderr)
 
+    def _converse(self, text: str) -> None:
+        if not self.engine.config.get("chat"):
+            return
+        with self._chat_lock:
+            try:
+                self.call("sendChatAction", {"chat_id": self.chat_id, "action": "typing"})
+            except TelegramError:
+                pass
+            try:
+                from .chat import Chat
+                reply = Chat(self.engine).ask(text, list(self._history))["reply"]
+                self._history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
+            except Exception as e:  # noqa: BLE001  le chat ne doit jamais faire tomber la lecture des boutons
+                reply = f"Erreur : {str(e)[:300]}"
+            try:   # texte brut : la réponse du modèle n'a pas à être du HTML valide
+                for i in range(0, len(reply), MAX_TEXT):
+                    self.call("sendMessage", {"chat_id": self.chat_id, "text": reply[i:i + MAX_TEXT],
+                                              "disable_web_page_preview": True})
+            except TelegramError as e:
+                print(f"reason: telegram {e}", file=sys.stderr)
+
     def poll_forever(self, stop: threading.Event | None = None) -> None:
         """Long polling de getUpdates (bot dédié uniquement). L'offset n'est pas persisté : au redémarrage, un clic
         redélivré retombe sur une réponse déjà enregistrée (doublon sans effet)."""
         offset = None
         while not (stop and stop.is_set()):
             try:
-                ups = self.call("getUpdates", {"timeout": 50, "allowed_updates": ["callback_query"],
+                ups = self.call("getUpdates", {"timeout": 50, "allowed_updates": ["callback_query", "message"],
                                                **({"offset": offset} if offset else {})}, timeout=60)
             except TelegramError as e:
                 print(f"reason: telegram {e}", file=sys.stderr)

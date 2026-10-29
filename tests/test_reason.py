@@ -357,6 +357,66 @@ class TestTelegram(unittest.TestCase):
         self.assertFalse(Telegram({}, eng).enabled)                # sans token : désactivé, jamais d'erreur
 
 
+class TestChat(unittest.TestCase):
+    def test_tools_loop_scope_host_tool_and_telegram(self):
+        from http.server import BaseHTTPRequestHandler
+        from reason.chat import Chat
+        from reason.llm import LLM
+        from reason.telegram import Telegram
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("escalate")]))
+        d = eng.decide(req(run_id="ch1"))
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = json.dumps({"path": self.path, "equity": 1234}).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        class Scripted(LLM):
+            def __init__(self, steps):
+                super().__init__("http://x", "scripted"); self.steps, self.seen = steps, []
+
+            def chat(self, messages, schema=None, temperature=None, max_tokens=None, retries=1):
+                self.seen.append(messages)
+                return self.steps.pop(0), {}
+        step = lambda tool, args, reply="": {"tool": tool, "args_json": json.dumps(args), "reply": reply}
+        m = Scripted([step("recent", {"namespace": "acme/invoices"}), step("recent", {"namespace": "other/ns"}),
+                      step("compte", {"window": "7d"}), step(None, {}, "Une décision : escalate.")])
+        eng.models["m"] = m; eng.roles["chat"] = "m"
+        cfg = {"namespaces": ["acme/*"], "tools": [{"name": "compte", "description": "équité",
+                                                    "url": f"http://127.0.0.1:{srv.server_address[1]}/compte"}]}
+        try:
+            out = Chat(eng, cfg).ask("que s'est-il passé ?")
+        finally:
+            srv.shutdown(); srv.server_close()
+        self.assertEqual(out["reply"], "Une décision : escalate.")
+        self.assertEqual(out["tools_used"], ["recent", "recent", "compte"])
+        last = m.seen[-1]
+        self.assertIn(d["decision_id"], last[3]["content"])                     # résultat de recent transmis au modèle
+        self.assertIn("non autorisé", last[5]["content"])                       # namespace hors périmètre refusé
+        self.assertIn("/compte?window=7d", last[7]["content"])                  # outil hôte : URL fixe, arguments en query
+        self.assertIn("LECTURE SEULE", last[0]["content"])
+        eng.roles["chat"] = None; eng.roles["executor"] = "d"
+        with self.assertRaises(ValueError):                                     # un décideur non LLM (Jev...) ne converse pas
+            Chat(eng, cfg).model()
+        m2 = Scripted([step(None, {}, "Bonjour.")])
+        eng.models["m2"] = m2; eng.roles["chat"] = "m2"; eng.config["chat"] = cfg
+        tg = Telegram({"bot_token": "t", "chat_id": "42"}, eng)
+        sent = []
+        tg.call = lambda method, payload, timeout=15: sent.append((method, payload)) or {}
+        tg.handle_update({"message": {"chat": {"id": 7}, "text": "salut"}})   # autre chat : aucune réponse
+        tg._converse("salut")
+        self.assertEqual([x for x, _ in sent], ["sendChatAction", "sendMessage"])
+        self.assertEqual(sent[1][1]["text"], "Bonjour.")
+        self.assertEqual(len(tg._history), 2)
+
+
 class TestAnthropic(unittest.TestCase):
     def test_messages_api_body_and_parsing(self):
         from reason.llm import LLM
@@ -563,6 +623,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual((st, g["answer"]["params"]), (200, {"limit": 300}))
         self.assertEqual(self.call("GET", "/decisions/d_nope")[0], 404)
         self.assertEqual(self.call("POST", "/telegram/callback", {"data": "rsn:x:0"})[0], 404)   # telegram non configuré
+        self.assertEqual(self.call("POST", "/chat", {"message": "?"})[0], 404)                   # chat non configuré
 
     def test_health_decide_outcome_auth(self):
         self.assertEqual(self.call("GET", "/health", token=None)[0], 200)

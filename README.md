@@ -385,6 +385,21 @@ app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
 
 `POST /decisions/answer` (`Client.answer`) records an answer without Telegram, with parameters if the action needs them. `python -m reason telegram-test` checks the token and the chat.
 
+### Read-only chat
+
+Ask questions in plain language ("what is waiting for me?", "why did we buy this?", "is the web channel calibrated?") with whichever model is connected to Reason: role `chat`, else `executor`. OpenAI-compatible or Claude; Jev, which does not converse, is refused. Tools go through the structured output Reason already gets from every provider, so no provider-specific tool calling is needed.
+
+```json
+"roles": {"chat": "deepseek"},
+"chat": {"namespaces": ["trader/*"], "max_steps": 5,
+         "tools": [{"name": "compte", "description": "equity, cash, positions, 24 h and 7 d change", "url": "http://127.0.0.1:8090/compte"},
+                   {"name": "logs", "description": "last agent log lines; args: {\"grep\": str}", "url": "http://127.0.0.1:8090/logs"}]}
+```
+
+- **Built-in tools**, read only: `namespaces`, `recent` (latest decisions with rationale, human answer and outcome), `decision`, `pending` (escalations awaiting a human, decisions awaiting an outcome), `value`, `calibration`, `outcomes`, `lessons`, limited to `chat.namespaces`.
+- **Host project tools**: a `GET` on a URL declared in the config; the model only picks the arguments (query string), never the URL. Expose only read-only data there. No tool writes, executes, trades or answers an escalation: the chat cannot act, even if a page or market text read by a tool tries to make it.
+- **Where**: on Telegram, a text message from the configured chat gets the answer (dedicated bot, `poll: true`; the last 6 exchanges are kept in memory); `POST /chat {"message", "history"}` (admin token or `namespaces: ["*"]`, `Client.chat`) for a shared bot or any other interface; `python -m reason chat "question"` in a terminal.
+
 ## Three facades, one engine
 
 ```mermaid
@@ -490,6 +505,7 @@ reason/
   jev.py         Jev (TypeSafe) adapter, same chat() interface
   client.py      Python client: timeout, retries, safe fallback
   telegram.py    Telegram: escalation messages, answer buttons, dedicated or shared bot
+  chat.py        read-only chat with any connected LLM, built-in and host tools
   lessons.py     per-namespace playbook: counters, dedup, pruning, pending queue
   reflector.py   failure → lesson proposals
   bench.py       proof bench: rules, injection, providers, concurrency, crash, isolation, baselines
@@ -500,7 +516,7 @@ reason/
   calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
   poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
-  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
+  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value chat telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests

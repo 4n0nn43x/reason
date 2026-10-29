@@ -449,6 +449,21 @@ app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
 
 يسجّل `POST /decisions/answer` (`Client.answer`) جواباً دون Telegram، مع معاملات إن احتاجها الإجراء. ويتحقق `python -m reason telegram-test` من الرمز والمحادثة.
 
+### محادثة للقراءة فقط
+
+اطرح أسئلة بلغة عادية («ما الذي ينتظرني؟»، «لماذا اشترينا هذا؟»، «هل قناة الويب معايرة؟») على أي نموذج موصول بـ Reason: الدور `chat`، وإلا `executor`. متوافق مع OpenAI أو Claude؛ ويُرفض Jev لأنه لا يحاور. تمرّ الأدوات عبر المخرجات المهيكلة التي يحصل عليها Reason أصلاً من كل مزوّد، فلا حاجة إلى tool calling خاص بمزوّد.
+
+```json
+"roles": {"chat": "deepseek"},
+"chat": {"namespaces": ["trader/*"], "max_steps": 5,
+         "tools": [{"name": "compte", "description": "equity, cash, positions, 24 h and 7 d change", "url": "http://127.0.0.1:8090/compte"},
+                   {"name": "logs", "description": "last agent log lines; args: {\"grep\": str}", "url": "http://127.0.0.1:8090/logs"}]}
+```
+
+- **أدوات مدمجة** للقراءة فقط: `namespaces`، `recent` (أحدث القرارات مع السبب وجواب الإنسان والنتيجة)، `decision`، `pending` (تصعيدات تنتظر إنساناً، وقرارات تنتظر نتيجة)، `value`، `calibration`، `outcomes`، `lessons`، ضمن `chat.namespaces`.
+- **أدوات المشروع المضيف**: طلب `GET` إلى عنوان معلن في الإعداد؛ يختار النموذج المعاملات فقط (query string) لا العنوان. لا تعرض هناك إلا بيانات للقراءة. لا أداة تكتب أو تنفّذ أو تتداول أو تجيب عن تصعيد: لا تستطيع المحادثة الفعل، حتى لو حاول نص صفحة أو سوق قرأته أداة دفعها إلى ذلك.
+- **أين**: على Telegram، تتلقى الرسالة النصية من المحادثة المحددة الجواب (بوت مخصّص، `poll: true`؛ تُحفظ آخر 6 تبادلات في الذاكرة)؛ و`POST /chat {"message", "history"}` (رمز المسؤول أو `namespaces: ["*"]`، `Client.chat`) لبوت مشترك أو أي واجهة أخرى؛ و`python -m reason chat "سؤال"` في الطرفية.
+
 ## ثلاث واجهات، محرّك واحد
 
 </div>
@@ -580,6 +595,7 @@ reason/
   jev.py         محوّل Jev (TypeSafe)، واجهة chat() نفسها
   client.py      عميل Python: مهلة، إعادة محاولة، إجراء احتياطي آمن
   telegram.py    Telegram: رسائل التصعيد، أزرار الجواب، بوت مخصّص أو مشترك
+  chat.py        محادثة للقراءة فقط مع أي LLM موصول، أدوات مدمجة وأدوات المضيف
   lessons.py     دفتر الدروس لكل نطاق: عدّادات، إزالة تكرار، تقليم، طابور انتظار
   reflector.py   فشل → مقترحات دروس
   bench.py       منصّة الإثبات: القواعد، الحقن، المزوّدون، التزامن، الانهيار، العزل، خطوط الأساس
@@ -590,7 +606,7 @@ reason/
   calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
   poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
   vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
-  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value chat telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
 tests/test_reason.py         60 اختباراً دون شبكة
