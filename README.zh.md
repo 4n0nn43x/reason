@@ -357,6 +357,32 @@ rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.0
 
 所有路由在连接被拒绝时都会重试；超时、409 或 5xx 只对幂等路由重试。`decide` 会变成幂等：缺少 `idempotency_key` 时自动生成，重发得到同一个决策。`/estimate` 与 `/execute`（计费的模型调用）超时后绝不重发。设置 `fallback` 后，服务不可达时返回 `tier: "client_fallback"`、`degraded: true`；4xx（无效请求、令牌被拒）总是抛出。
 
+### Telegram
+
+Reason 可以在 Telegram 上通知某人有决策在等待他，并通过按钮收取回答。任何项目都可以使用，其中没有任何针对特定调用方的内容。
+
+```json
+"telegram": {"bot_token_env": "REASON_TELEGRAM_TOKEN", "chat_id_env": "REASON_TELEGRAM_CHAT_ID",
+             "namespaces": ["trader/*"], "poll": true, "quiet_hours": {"start": 21, "end": 7, "utc_offset": 1}}
+```
+
+- **发送内容**：每一次升级给人类的决策（每个无需参数即可执行的动作一个按钮，另加 `abstain`；需要参数的动作会列出，需通过 API 回答），以及降级模式下执行的每个回退动作（仅作通知）。预算用完时每个命名空间每天只提醒一次。发送从不拖慢决策；Telegram 出错只记录日志。静默时段内消息不响铃。
+- **回答**：第一次点击有效，之后的点击视为重复；只监听配置的聊天。回答会被记录（日志中的 `HumanAnswered`），调用方通过 `GET /decisions/<id>`（或 `Client.decision(id)`）读取，再用回答中的 `intent_key` 执行。Reason 从不执行任何操作。之后上报的结果若未给出 `human_feedback.correct_action`，会自动采用该回答，从而为升级的提议打分。
+- **专用机器人**（`"poll": true`）：`reason serve` 自行读取其机器人的更新。Telegram 每个 token 只允许一个读取者，因此绝不要在已有应用读取更新的 token 上设置 `poll`。
+- **共享机器人**（`"poll": false`）：Reason 只负责发送。读取该机器人的应用把以 `rsn:` 开头的回调转发到 `POST /telegram/callback`（scope `approve`），并显示返回的 `text`：
+
+```python
+async def on_reason(update, context):            # python-telegram-bot; same idea with any other library
+    q = update.callback_query
+    r = await asyncio.to_thread(rc.telegram_callback, q.data, q.from_user.username or "")
+    await q.answer()
+    await q.edit_message_text(q.message.text_html + "\n\n" + r["text"], parse_mode="HTML")
+
+app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
+```
+
+`POST /decisions/answer`（`Client.answer`）可不经 Telegram 记录回答，动作需要参数时可附带参数。`python -m reason telegram-test` 用于检查 token 和聊天。
+
 ## 三个门面，一个引擎
 
 ```mermaid
@@ -461,6 +487,7 @@ reason/
   llm.py         兼容 OpenAI 与 Anthropic Messages API 的客户端（urllib），严格或 json_object 输出，重试
   jev.py         Jev（TypeSafe）适配器，相同的 chat() 接口
   client.py      Python 客户端：超时、重试、安全回退
+  telegram.py    Telegram：升级通知、回答按钮、专用或共享机器人
   lessons.py     按命名空间的经验手册：计数器、去重、修剪、待审队列
   reflector.py   失败 → 经验提案
   bench.py       证明测试台：规则、注入、提供方、并发、崩溃、隔离、基线
@@ -471,7 +498,7 @@ reason/
   calib.py       Brier、log-loss、RPS、Murphy 分解、Platt、Wilson、bootstrap（标准库）
   poller.py      延迟结果：JSONL / HTTP / GraphQL 来源、水位线、匹配、时限
   vault.py       markdown 知识库：frontmatter 经验、提案、复盘（从不改写已有文件）
-  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
+  __main__.py    CLI：serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        PR diff 的测试篡改检测器
 examples/                    配置、请求、n8n 工作流、Claude Code 设置
 tests/test_reason.py         60 个离线测试

@@ -423,6 +423,32 @@ rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.0
 
 تُعاد المحاولة عند رفض الاتصال لكل المسارات، وعند تجاوز المهلة أو 409 أو 5xx للمسارات المتساوية القوة فقط. يصبح `decide` متساوي القوة: يُولَّد `idempotency_key` إن غاب، فيعيد الإرسال القرار نفسه. لا يُعاد إرسال `/estimate` و`/execute` (استدعاءات نموذج مدفوعة) بعد تجاوز المهلة أبداً. مع `fallback` تعطي خدمة غير متاحة `tier: "client_fallback"` و`degraded: true`؛ أما 4xx (طلب غير صالح، رمز مرفوض) فيُرفع دائماً.
 
+### Telegram
+
+يستطيع Reason أن يُعلم شخصاً على Telegram بأن قراراً ينتظره، وأن يتلقى جوابه عبر زر. يمكن لأي مشروع استخدامه، ولا شيء فيه خاص بمستدعٍ بعينه.
+
+```json
+"telegram": {"bot_token_env": "REASON_TELEGRAM_TOKEN", "chat_id_env": "REASON_TELEGRAM_CHAT_ID",
+             "namespaces": ["trader/*"], "poll": true, "quiet_hours": {"start": 21, "end": 7, "utc_offset": 1}}
+```
+
+- **ما يُرسَل**: كل تصعيد إلى إنسان (زر لكل إجراء يمكن تنفيذه دون معاملات، إضافة إلى `abstain`؛ والإجراءات التي تحتاج معاملات تُذكر ويُجاب عنها عبر الواجهة البرمجية)، وكل إجراء احتياطي نُفّذ في الوضع المتدهور للعلم. بلوغ الميزانية يُبلَّغ مرة واحدة لكل namespace في اليوم. الإرسال لا يؤخر أي قرار؛ وخطأ Telegram يُسجَّل فقط. في ساعات الهدوء تصل الرسائل بلا صوت.
+- **الأجوبة**: النقرة الأولى هي المعتمدة وما بعدها مكرر؛ ولا يُستمع إلا إلى المحادثة المحددة. يُسجَّل الجواب (`HumanAnswered` في السجل) ويقرؤه المستدعي عبر `GET /decisions/<id>` (أو `Client.decision(id)`) ثم ينفّذه بمفتاح `intent_key` الخاص بالجواب. Reason لا ينفّذ شيئاً أبداً. النتيجة المُبلَّغ عنها لاحقاً تعتمد الجواب كـ `human_feedback.correct_action` إن لم تتضمن واحداً، فتُقيَّم المقترحات المصعَّدة.
+- **بوت مخصّص** (`"poll": true`): يقرأ `reason serve` تحديثات بوته بنفسه. لا يسمح Telegram إلا بقارئ واحد لكل رمز، فلا تفعّل `poll` أبداً على رمز تطبيق يقرأ تحديثاته أصلاً.
+- **بوت مشترك** (`"poll": false`): يكتفي Reason بالإرسال. التطبيق الذي يقرأ البوت يمرّر الاستدعاءات التي تبدأ بـ `rsn:` إلى `POST /telegram/callback` (النطاق `approve`) ويعرض `text` المُعاد:
+
+```python
+async def on_reason(update, context):            # python-telegram-bot; same idea with any other library
+    q = update.callback_query
+    r = await asyncio.to_thread(rc.telegram_callback, q.data, q.from_user.username or "")
+    await q.answer()
+    await q.edit_message_text(q.message.text_html + "\n\n" + r["text"], parse_mode="HTML")
+
+app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
+```
+
+يسجّل `POST /decisions/answer` (`Client.answer`) جواباً دون Telegram، مع معاملات إن احتاجها الإجراء. ويتحقق `python -m reason telegram-test` من الرمز والمحادثة.
+
 ## ثلاث واجهات، محرّك واحد
 
 </div>
@@ -553,6 +579,7 @@ reason/
   llm.py         عميل متوافق مع OpenAI ومع واجهة Messages من Anthropic (urllib)، مخرجات صارمة أو json_object، إعادة محاولة
   jev.py         محوّل Jev (TypeSafe)، واجهة chat() نفسها
   client.py      عميل Python: مهلة، إعادة محاولة، إجراء احتياطي آمن
+  telegram.py    Telegram: رسائل التصعيد، أزرار الجواب، بوت مخصّص أو مشترك
   lessons.py     دفتر الدروس لكل نطاق: عدّادات، إزالة تكرار، تقليم، طابور انتظار
   reflector.py   فشل → مقترحات دروس
   bench.py       منصّة الإثبات: القواعد، الحقن، المزوّدون، التزامن، الانهيار، العزل، خطوط الأساس
@@ -563,7 +590,7 @@ reason/
   calib.py       Brier، log-loss، RPS، تفكيك Murphy، Platt، Wilson، bootstrap (المكتبة القياسية)
   poller.py      النتائج المؤجلة: مصادر JSONL / HTTP / GraphQL، علامة مائية، مطابقة، أفق
   vault.py       مستودع markdown: دروس frontmatter، مقترحات، مراجعات لاحقة (لا يعيد كتابة ملف موجود أبداً)
-  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
+  __main__.py    سطر الأوامر: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        كاشف العبث بالاختبارات في فروق PR
 examples/                    إعدادات، طلب، مسار n8n، إعدادات Claude Code
 tests/test_reason.py         60 اختباراً دون شبكة

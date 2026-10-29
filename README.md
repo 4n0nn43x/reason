@@ -359,6 +359,32 @@ rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.0
 
 Retries happen on a refused connection for every route, and on timeout, 409 or 5xx only for idempotent routes. `decide` becomes idempotent: an `idempotency_key` is generated when missing, so a resend returns the same decision. `/estimate` and `/execute` (billed model calls) are never resent after a timeout. With `fallback`, an unreachable service yields `tier: "client_fallback"`, `degraded: true`; a 4xx (invalid request, refused token) is always raised.
 
+### Telegram
+
+Reason can tell a human on Telegram that a decision is waiting for them, and take the answer from a button. Any project can use it; nothing in it is specific to one caller.
+
+```json
+"telegram": {"bot_token_env": "REASON_TELEGRAM_TOKEN", "chat_id_env": "REASON_TELEGRAM_CHAT_ID",
+             "namespaces": ["trader/*"], "poll": true, "quiet_hours": {"start": 21, "end": 7, "utc_offset": 1}}
+```
+
+- **Sent**: every escalation to a human (one button per action playable without parameters, plus `abstain`; actions that need parameters are listed, to answer through the API) and every fallback played in degraded mode, for information. A reached budget is reported once per namespace and per day. Sending never delays a decision; a Telegram error is only logged. Quiet hours send silently.
+- **Answers**: the first click counts, later ones are duplicates; only the configured chat is heard. The answer is stored (`HumanAnswered` in the journal) and read by the caller with `GET /decisions/<id>` (or `Client.decision(id)`), which then executes it with the answer's `intent_key`. Reason never executes anything. The outcome reported later takes the answer as `human_feedback.correct_action` if it gives none, so escalated proposals are scored.
+- **Dedicated bot** (`"poll": true`): `reason serve` reads its own bot's updates. Telegram allows only one reader per token, so never set `poll` on the token of an application that already reads its updates.
+- **Shared bot** (`"poll": false`): Reason only sends. The application that reads the bot forwards the callbacks that start with `rsn:` to `POST /telegram/callback` (scope `approve`) and shows the returned `text`:
+
+```python
+async def on_reason(update, context):            # python-telegram-bot; same idea with any other library
+    q = update.callback_query
+    r = await asyncio.to_thread(rc.telegram_callback, q.data, q.from_user.username or "")
+    await q.answer()
+    await q.edit_message_text(q.message.text_html + "\n\n" + r["text"], parse_mode="HTML")
+
+app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
+```
+
+`POST /decisions/answer` (`Client.answer`) records an answer without Telegram, with parameters if the action needs them. `python -m reason telegram-test` checks the token and the chat.
+
 ## Three facades, one engine
 
 ```mermaid
@@ -463,6 +489,7 @@ reason/
   llm.py         OpenAI-compatible and Anthropic Messages client (urllib), strict or json_object output, retries
   jev.py         Jev (TypeSafe) adapter, same chat() interface
   client.py      Python client: timeout, retries, safe fallback
+  telegram.py    Telegram: escalation messages, answer buttons, dedicated or shared bot
   lessons.py     per-namespace playbook: counters, dedup, pruning, pending queue
   reflector.py   failure → lesson proposals
   bench.py       proof bench: rules, injection, providers, concurrency, crash, isolation, baselines
@@ -473,7 +500,7 @@ reason/
   calib.py       Brier, log-loss, RPS, Murphy decomposition, Platt, Wilson, bootstrap (stdlib)
   poller.py      deferred outcomes: JSONL / HTTP / GraphQL sources, watermark, matching, horizon
   vault.py       markdown vault: frontmatter lessons, proposals, post-mortems (never rewrites existing files)
-  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
+  __main__.py    CLI: serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        test-tampering detector for PR diffs
 examples/                    configs, request, rules v2 and their test cases, n8n workflow, Claude Code settings
 tests/test_reason.py         60 offline tests

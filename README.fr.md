@@ -357,6 +357,32 @@ rc.outcome({"decision_id": dec["decision_id"], "result": "success", "value": 0.0
 
 Les nouvelles tentatives ont lieu sur connexion refusée pour toutes les routes, et sur délai dépassé, 409 ou 5xx seulement pour les routes idempotentes. `decide` le devient : une `idempotency_key` est générée si elle manque, donc un renvoi rend la même décision. `/estimate` et `/execute` (appels modèle facturés) ne sont jamais renvoyés après un délai dépassé. Avec `fallback`, un service injoignable donne `tier: "client_fallback"`, `degraded: true` ; une erreur 4xx (requête invalide, jeton refusé) est toujours levée.
 
+### Telegram
+
+Reason peut prévenir un humain sur Telegram qu'une décision l'attend, et recueillir sa réponse par un bouton. N'importe quel projet peut s'en servir : rien n'y est propre à un appelant.
+
+```json
+"telegram": {"bot_token_env": "REASON_TELEGRAM_TOKEN", "chat_id_env": "REASON_TELEGRAM_CHAT_ID",
+             "namespaces": ["trader/*"], "poll": true, "quiet_hours": {"start": 21, "end": 7, "utc_offset": 1}}
+```
+
+- **Envoyé** : chaque escalade vers l'humain (un bouton par action jouable sans paramètre, plus `abstain` ; les actions qui demandent des paramètres sont listées, à répondre par l'API) et chaque repli joué en mode dégradé, pour information. Un budget atteint est signalé une fois par namespace et par jour. L'envoi ne retarde jamais une décision ; une erreur Telegram est seulement journalisée. Pendant les heures calmes, les messages arrivent sans son.
+- **Réponses** : le premier clic compte, les suivants sont des doublons ; seul le chat configuré est écouté. La réponse est enregistrée (`HumanAnswered` dans le journal) et l'appelant la lit avec `GET /decisions/<id>` (ou `Client.decision(id)`), puis l'exécute avec l'`intent_key` de la réponse. Reason n'exécute jamais rien. L'issue rapportée ensuite reprend la réponse comme `human_feedback.correct_action` si elle n'en donne pas, ce qui note les propositions escaladées.
+- **Bot dédié** (`"poll": true`) : `reason serve` lit lui-même les mises à jour de son bot. Telegram n'accepte qu'un lecteur par token : ne jamais mettre `poll` sur le token d'une application qui lit déjà ses mises à jour.
+- **Bot partagé** (`"poll": false`) : Reason ne fait qu'envoyer. L'application qui lit le bot transmet les callbacks qui commencent par `rsn:` à `POST /telegram/callback` (scope `approve`) et affiche le `text` renvoyé :
+
+```python
+async def on_reason(update, context):            # python-telegram-bot ; même principe avec toute autre bibliothèque
+    q = update.callback_query
+    r = await asyncio.to_thread(rc.telegram_callback, q.data, q.from_user.username or "")
+    await q.answer()
+    await q.edit_message_text(q.message.text_html + "\n\n" + r["text"], parse_mode="HTML")
+
+app.add_handler(CallbackQueryHandler(on_reason, pattern=r"^rsn:"))
+```
+
+`POST /decisions/answer` (`Client.answer`) enregistre une réponse sans Telegram, avec des paramètres si l'action en demande. `python -m reason telegram-test` vérifie le token et le chat.
+
 ## Trois façades, un moteur
 
 ```mermaid
@@ -461,6 +487,7 @@ reason/
   llm.py         client compatible OpenAI et API Messages d'Anthropic (urllib), sortie stricte ou json_object, relances
   jev.py         adaptateur Jev (TypeSafe), même interface chat()
   client.py      client Python : délai, nouvelles tentatives, repli sûr
+  telegram.py    Telegram : messages d'escalade, boutons de réponse, bot dédié ou partagé
   lessons.py     playbook par namespace : compteurs, dédup, élagage, file d'attente
   reflector.py   échec → propositions de leçons
   bench.py       banc de preuve : règles, injection, fournisseurs, concurrence, crash, isolation, baselines
@@ -471,7 +498,7 @@ reason/
   calib.py       Brier, log-loss, RPS, décomposition de Murphy, Platt, Wilson, bootstrap (stdlib)
   poller.py      issues différées : sources JSONL / HTTP / GraphQL, watermark, appariement, horizon
   vault.py       vault markdown : leçons en frontmatter, propositions, post-mortems (ne réécrit jamais un fichier existant)
-  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value poll pending fingerprint bench shadow init
+  __main__.py    CLI : serve decide outcome execute estimate estimate-record estimate-outcome lessons rules eval outcomes calibrate value telegram-test poll pending fingerprint bench shadow init
 scripts/check_diff.py        détecteur de falsification de tests dans un diff
 examples/                    config, requête, workflow n8n, settings Claude Code
 tests/test_reason.py         60 tests hors ligne

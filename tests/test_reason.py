@@ -311,6 +311,52 @@ class TestClient(unittest.TestCase):
             dead.decide(req())
 
 
+class TestTelegram(unittest.TestCase):
+    def test_escalation_message_button_answer_and_outcome(self):
+        from reason.telegram import Telegram
+        tmp = tempfile.mkdtemp()
+        eng = engine(tmp, decider=FakeLLM("d", [typed("approve", conf=0.3)]))
+        tg = Telegram({"bot_token": "t", "chat_id": "42"}, eng)
+        sent = []
+        tg.call = lambda method, payload, timeout=15: sent.append((method, payload)) or {"message_id": 7, "chat": {"id": 42}}
+        d = eng.decide(req(run_id="tg1"))                          # confiance faible : escalade vers l'humain
+        text, buttons = tg.message(eng._by_id[d["decision_id"]]["request"], d)
+        self.assertIn("Décision requise", text)
+        self.assertIn("approve", text)                             # proposition du modèle + action à paramètres signalée
+        self.assertEqual([b[0]["text"] for b in buttons], ["escalate", "abstain"])   # approve exige limit : pas de bouton
+        data = buttons[0][0]["callback_data"]
+        self.assertLessEqual(len(data.encode()), 64)
+        tg.handle_update({"callback_query": {"id": "q", "data": data, "from": {"username": "eve"},
+                                             "message": {"message_id": 7, "text": "x", "chat": {"id": 99}}}})
+        self.assertIsNone(eng.decision(d["decision_id"])["answer"])   # autre chat : ignoré
+        tg.handle_update({"callback_query": {"id": "q", "data": data, "from": {"username": "owner"},
+                                             "message": {"message_id": 7, "text": "x", "chat": {"id": 42}}}})
+        ans = eng.decision(d["decision_id"])["answer"]
+        self.assertEqual((ans["action"], ans["by"]), ("escalate", "owner"))
+        self.assertEqual([m for m, _ in sent], ["answerCallbackQuery", "editMessageText"])
+        again = tg.handle_callback(buttons[1][0]["callback_data"], "owner")      # la première réponse compte
+        self.assertEqual((again["recorded"], again["action"]), (False, "escalate"))
+        with self.assertRaises(ValueError):
+            tg.handle_callback("rsn:" + d["decision_id"] + ":9")
+        eng.outcome({"decision_id": d["decision_id"], "result": "success"})
+        self.assertEqual(eng._outcomes[d["decision_id"]]["human_feedback"]["correct_action"], "escalate")
+        eng2 = Engine({"data_dir": tmp, "models": {}, "roles": {}})            # réponse relue depuis le journal
+        self.assertEqual(eng2.decision(d["decision_id"])["answer"]["action"], "escalate")
+
+    def test_degraded_info_once_per_day_and_quiet_hours(self):
+        from reason.telegram import Telegram
+        eng = engine(tempfile.mkdtemp())
+        tg = Telegram({"bot_token": "t", "chat_id": "42", "quiet_hours": {"start": 0, "end": 24}}, eng)
+        r = req()
+        fb = {"decision_id": "d_x", "action": {"name": "escalate"}, "needs_human": {"required": False},
+              "degraded": True, "budget_exhausted": True}
+        self.assertIn("Mode dégradé", tg.message(r, fb)[0])
+        self.assertIsNone(tg.message(r, fb))                       # budget : une fois par jour et par namespace
+        self.assertIsNone(tg.message(r, {**fb, "degraded": False}))  # décision normale : rien
+        self.assertTrue(tg._quiet_now())
+        self.assertFalse(Telegram({}, eng).enabled)                # sans token : désactivé, jamais d'erreur
+
+
 class TestAnthropic(unittest.TestCase):
     def test_messages_api_body_and_parsing(self):
         from reason.llm import LLM
@@ -503,6 +549,20 @@ class TestServer(unittest.TestCase):
         c.request(method, path, json.dumps(body) if body is not None else None, headers)
         r = c.getresponse(); data = r.read()
         return r.status, (json.loads(data) if data else None)
+
+    def test_decision_answer_endpoints(self):
+        self.dec.answers.insert(0, typed("approve", conf=0.2))
+        st, d = self.call("POST", "/decide", req(run_id="srv-ans"))
+        self.assertEqual(d["action"]["name"], "ask_human")
+        st, r = self.call("POST", "/decisions/answer", {"decision_id": d["decision_id"], "action": "approve", "params": {}})
+        self.assertEqual(st, 400)                                  # paramètres invalides pour approve
+        st, r = self.call("POST", "/decisions/answer", {"decision_id": d["decision_id"], "action": "approve",
+                                                         "params": {"limit": 300}, "by": "api"})
+        self.assertEqual((st, r["recorded"]), (200, True))
+        st, g = self.call("GET", "/decisions/" + d["decision_id"])
+        self.assertEqual((st, g["answer"]["params"]), (200, {"limit": 300}))
+        self.assertEqual(self.call("GET", "/decisions/d_nope")[0], 404)
+        self.assertEqual(self.call("POST", "/telegram/callback", {"data": "rsn:x:0"})[0], 404)   # telegram non configuré
 
     def test_health_decide_outcome_auth(self):
         self.assertEqual(self.call("GET", "/health", token=None)[0], 200)

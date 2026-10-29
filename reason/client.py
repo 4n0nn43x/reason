@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-IDEMPOTENT = {"/decide", "/outcome", "/estimate/outcome", "/estimate/record"}
+IDEMPOTENT = {"/decide", "/outcome", "/estimate/outcome", "/estimate/record", "/decisions/answer", "/telegram/callback"}
 
 
 class ReasonError(RuntimeError):
@@ -58,6 +58,19 @@ class Client:
 
     def execute(self, x: dict) -> dict:
         return self.post("/execute", x)
+
+    def answer(self, decision_id: str, action: str, params: dict | None = None, by: str = "", note: str = "") -> dict:
+        """Réponse humaine à une décision escaladée ; la première compte."""
+        return self.post("/decisions/answer", {"decision_id": decision_id, "action": action, "params": params or {},
+                                               "by": by, "note": note})
+
+    def decision(self, decision_id: str) -> dict:
+        """{decision, answer, outcome} : pour attendre la réponse humaine à une escalade."""
+        return self._call("GET", f"/decisions/{decision_id}", None)
+
+    def telegram_callback(self, data: str, by: str = "") -> dict:
+        """Bot partagé : relaie le callback_data d'un bouton Reason ; afficher le `text` rendu."""
+        return self.post("/telegram/callback", {"data": data, "by": by})
 
     def lessons(self, ns: str) -> dict:
         return self._call("GET", f"/lessons/{ns}", None)

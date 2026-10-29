@@ -3,6 +3,8 @@
   POST /mcp     JSON-RPC MCP (initialize, tools/list, tools/call), stateless        (n8n MCP Client, Claude, Cursor...)
   POST /hooks/claude   hook http de Claude Code : PreToolUse → decide, SessionStart/UserPromptSubmit → leçons
   POST /hooks/claude/answer   réponse humaine à un appel d'outil escaladé (scope approve)
+  POST /decisions/answer      réponse humaine à une décision escaladée (scope approve) ; GET /decisions/<id> (scope read)
+  POST /telegram/callback     clic sur un bouton Reason relayé par l'application qui lit le bot partagé (scope approve)
 Stdlib uniquement (ThreadingHTTPServer).
 """
 from __future__ import annotations
@@ -15,6 +17,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -152,6 +155,14 @@ class Handler(BaseHTTPRequestHandler):
             self.engine.refresh()
             rec = self.engine._by_id.get(body.get("decision_id"))
             return rec["request"]["namespace"] if rec else None
+        if kind in ("answer", "telegram_callback"):
+            self.engine.refresh()
+            did = body.get("decision_id")
+            if kind == "telegram_callback":
+                parts = str(body.get("data") or "").split(":")
+                did = parts[1] if len(parts) == 3 else None
+            rec = self.engine._by_id.get(did) if isinstance(did, str) else None
+            return rec["request"]["namespace"] if rec else None
         if kind == "estimate_outcome":
             self.engine.refresh()
             rec = self.engine._estimates.get(body.get("estimate_id"))
@@ -178,6 +189,17 @@ class Handler(BaseHTTPRequestHandler):
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
             if host not in LOOPBACK:
                 return self._json(403, {"error": "hôte refusé"})
+        if self.path.startswith("/decisions/"):
+            did = self.path[len("/decisions/"):]
+            self.engine.refresh()
+            rec = self.engine._by_id.get(did)
+            try:
+                self._check("read", rec["request"]["namespace"] if rec else None)
+            except Forbidden as e:
+                return self._json(403, {"error": str(e)})
+            if not rec:
+                return self._json(404, {"error": "décision inconnue"})
+            return self._json(200, self.engine.decision(did))
         if self.path.startswith(("/lessons/", "/pending/")):
             try:
                 self._check("read", self.path.split("/", 2)[2])
@@ -217,6 +239,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self._claude_hook(body))
             if self.path == "/hooks/claude/answer":
                 return self._json(200, self._hook_answer(body))
+            if self.path == "/decisions/answer":
+                self._check("approve", self._ns_of("answer", body))
+                return self._json(200, self.engine.answer(body))
+            if self.path == "/telegram/callback":
+                if not self.engine.telegram:
+                    return self._json(404, {"error": "telegram non configuré"})
+                self._check("approve", self._ns_of("telegram_callback", body))
+                return self._json(200, self.engine.telegram.handle_callback(body.get("data"), str(body.get("by") or "")))
             return self._json(404, {"error": "inconnu"})
         except Forbidden as e:
             return self._json(403, {"error": str(e)})
@@ -446,6 +476,9 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8787) -> None:
     except OSError:
         sys.exit(f"un autre `reason serve` utilise déjà {engine.data_dir}")
     Handler.engine = engine
+    if engine.telegram and engine.telegram.enabled and engine.telegram.poll:
+        threading.Thread(target=engine.telegram.poll_forever, daemon=True).start()
+        print("Reason : lecture des réponses Telegram (bot dédié)", file=sys.stderr)
     srv = ThreadingHTTPServer((host, port), Handler)
     mode = "jeton administrateur" if Handler.token else ("jetons par namespace" if Handler.tokens else "AUCUNE (--insecure)")
     print(f"Reason {__version__} sur http://{host}:{port}  rôles={engine.roles}  auth={mode}", file=sys.stderr)

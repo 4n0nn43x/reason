@@ -171,8 +171,13 @@ class Engine:
         self._journal_offsets: dict[str, int] = {}
         self._journaled: set[str] = set()                                   # ids écrits ou relus dans un journal (purgeables)
         self._spend: dict[tuple[str, str], dict] = {}                       # (namespace, jour UTC) -> {usd, tokens}
+        self._answers: dict[str, dict] = {}                                 # decision_id -> réponse humaine (la première)
         self._shadow_q: queue.Queue | None = None
         self.refresh()
+        self.telegram = None
+        if config.get("telegram"):
+            from .telegram import Telegram
+            self.telegram = Telegram(config["telegram"], self)
 
     # --- rôles de modèles
     def model(self, role: str, overrides: dict | None = None):
@@ -387,6 +392,8 @@ class Engine:
                 self._journaled.add(ev["estimate"]["estimate_id"])
             elif t == "EstimateResolved":
                 self._estimate_done.add(ev["estimate_id"])
+            elif t == "HumanAnswered":
+                self._answers.setdefault(ev["decision_id"], ev["answer"])
 
     def _index(self, req: dict, dec: dict, ts: float | None = None) -> None:
         if dec["decision_id"] in self._by_id:     # déjà indexée (relecture de notre propre écriture)
@@ -474,7 +481,51 @@ class Engine:
             self._shadow(req, dec)
         except Exception as e:          # config shadow invalide : la décision est déjà journalisée et doit être servie
             print(f"reason: shadow ignoré ({e})", file=sys.stderr)
+        if self.telegram:
+            self.telegram.decision(req, dec)
         return dec
+
+    def answer(self, b: dict) -> dict:
+        """Réponse humaine à une décision escaladée (ask_human) ou prise en mode dégradé : la première réponse compte, une
+        suivante est un doublon. L'appelant la lit (GET /decisions/<id>) puis l'exécute ; l'issue rapportée ensuite la
+        reprend comme human_feedback.correct_action si elle n'en donne pas."""
+        errs = validate(b, ANSWER_SCHEMA)
+        if errs:
+            raise ValueError("answer invalide: " + "; ".join(errs))
+        self.refresh()
+        rec = self._by_id.get(b["decision_id"])
+        if not rec:
+            raise KeyError(f"décision inconnue: {b['decision_id']}")
+        req, dec = rec["request"], rec["decision"]
+        if not ((dec.get("needs_human") or {}).get("required") or dec.get("degraded")):
+            raise ValueError("cette décision n'attend pas de réponse humaine")
+        name = b["action"]
+        cand = next((a for a in req["candidate_actions"] if a["name"] == name), None)
+        if cand is None and name != "abstain":
+            raise ValueError(f"action hors des candidates: {name}")
+        params = b.get("params") or {}
+        perrs = validate(params, cand.get("schema", {"type": "object"})) if cand else []
+        if perrs:
+            raise ValueError(f"paramètres invalides: {perrs}")
+        row = {"decision_id": dec["decision_id"], "action": name, "params": params, "by": str(b.get("by") or "")[:120],
+               "note": str(b.get("note") or "")[:480], "ts": time.time(),
+               "intent_key": intent_key(req["namespace"], dec["decision_id"], name, params) if name != "abstain" else None}
+        with self._lock:
+            prev = self._answers.get(dec["decision_id"])
+            if prev:
+                return {"recorded": False, "duplicate": True, "answer": prev}
+            self._answers[dec["decision_id"]] = row
+        self._journal(req["namespace"], {"type": "HumanAnswered", "decision_id": dec["decision_id"], "answer": row})
+        return {"recorded": True, "answer": row}
+
+    def decision(self, did: str) -> dict:
+        """Décision, réponse humaine et dernière issue, pour l'appelant qui attend une réponse."""
+        self.refresh()
+        rec = self._by_id.get(did)
+        if not rec:
+            raise KeyError(f"décision inconnue: {did}")
+        with self._lock:
+            return {"decision": rec["decision"], "answer": self._answers.get(did), "outcome": self._outcomes.get(did)}
 
     def _shadow(self, req: dict, dec: dict) -> None:
         """Mode ombre (config["shadow"] : {glob de namespace: surcharges de modèles}) : le challenger décide la même
@@ -760,6 +811,10 @@ class Engine:
         ns = req["namespace"]
         names = [a["name"] for a in req["candidate_actions"]]
         hf = o.get("human_feedback") or {}
+        ans = self._answers.get(o["decision_id"])
+        if ans and not hf.get("correct_action"):     # la réponse humaine (Telegram, API) vaut correction
+            o = {**o, "human_feedback": {**hf, "correct_action": ans["action"]}}
+            hf = o["human_feedback"]
         if hf.get("correct_action") and hf["correct_action"] not in names + list(META_ACTIONS):
             raise ValueError(f"correct_action hors des actions candidates: {hf['correct_action']}")
         explicit_ref = "source_ref" in o
@@ -1241,6 +1296,9 @@ ESTIMATE_RECORD_SCHEMA = {"type": "object", "required": ["namespace", "kind", "e
                                          "resolves_at": {"type": ["string", "null"]}, "now": {"type": ["string", "number", "null"]},
                                          "source": {"type": "string", "enum": ["fact", "model", "opinion"]},
                                          "evidence": {"type": "array"}, "rationale": {"type": "string"}}}
+ANSWER_SCHEMA = {"type": "object", "required": ["decision_id", "action"],
+                 "properties": {"decision_id": {"type": "string"}, "action": {"type": "string"}, "params": {"type": "object"},
+                                "by": {"type": "string"}, "note": {"type": "string"}}}
 ESTIMATE_OUTCOME_SCHEMA = {"type": "object", "required": ["estimate_id"],
                            "properties": {"estimate_id": {"type": "string"}, "outcome": {"type": ["integer", "null"], "minimum": 0},
                                           "outcome_label": {"type": ["string", "null"]}, "value": {"type": ["number", "null"]},
